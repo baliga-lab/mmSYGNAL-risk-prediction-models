@@ -1,0 +1,161 @@
+---
+title: "mmSYGNAL risk model tutorial"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r library}
+library(tidyverse)
+library(here)
+library(caret)
+library(readr)
+library(knitr)
+
+```
+
+# **mmSYGNAL risk prediction**  
+  
+Tutorial for applying mmSYGNAL risk models to a new patient diagnosed with 
+multiple myeloma. Risk models were generated separately based on the genetic
+abnormality subtypes patients in our training cohort exhibited. The agnostic 
+model was generated with all patients in training cohort regardless of subtype
+and is appropriate for patients that do not exhibit a relevant genetic subtype
+or when subtype information is not obtainable.  
+  
+### **mmSYGNAL risk models**    
+  
+The following risk models are available.    
+  
+no subtype    
+   
+1. agnostic  
+
+cytogentic subtypes  
+  
+2. amp(1q)  
+3. del(13)  
+4. del(1p) 
+5. t(4;14)
+  
+RNAseq subtypes  
+  
+5. FGFR3  
+  
+### **Steps required for pipeline**    
+  
+1. Generate gene expression data for patient and annotate with ensembl gene ids. 
+RNAseq data is recommended but mmSYGNAL also functions with microarray data.
+  
+2. Apply mmSYGNAL model to gene expression data to generate program activity. 
+See 'Wall et al, Genetic program activity delineates risk, relapse, and therapy responsiveness in multiple myeloma,
+Precision Oncology, 2021' for instructions on how to apply mmSYGNAL.
+  
+3. Format patient's program activity into a data.frame where the row is the
+patient's program activity column titles are the program label (0 to 140).  
+
+4. Identify which genetic abnormality risk subtypes the patient exhibits and
+apply the appropriate risk models. See code below for examples. 
+  
+5. If desired choose only the highest grade models (A > B > C) if a patient 
+exhbits multiple subtypes. If a patient shows multiple subtypes of the same
+grade then take the mean of the risk scores.  
+  
+6. The patients risk classification is generated based on their predicted 
+risk score as shown below:  
+  
++ low risk: < 0.5  
+  
++ high risk: >= 0.5 and < 0.6  
+  
++ extreme risk: >= 0.6  
+  
+
+```{r load}
+
+## mmSYGNAL program activity - rows are patients (n=3) and columns are 
+## programs (n=141). Each cell is the program activity 
+data <- read_csv(here("data/patient_program_activity.csv"))
+
+## mmSYGNAL risk model which ignores subtype (trained with all patients in cohort)
+agnostic_risk <- readRDS(here("data/agnostic_risk_model.Rds"))
+
+## mmSYGNAL risk models based on cytogenetics (models are build only with
+## patients in training cohort that exhibit a specific risk subtype)
+amp1q_risk <- readRDS(here("data/amp(1q)_risk_model.Rds"))
+del13_risk <- readRDS(here("data/del(13)_risk_model.Rds"))
+del1p_risk <- readRDS(here("data/del(1p)_risk_model.Rds"))
+t414_risk <- readRDS(here("data/t(4;14)_risk_model.Rds"))
+
+## mmSYGNAL risk model based on RNASeq (model is built with only patients
+## in training cohort exhibiting FGFR3 abnormality)
+fgfr3_risk <- readRDS(here("data/FGFR3_risk_model.Rds"))
+
+## store results here
+all_results <- data.frame()
+```
+
+```{r risk__agnostic}
+
+## apply risk models to one patient
+p1 <- data[3,]
+
+## apply mmSYGNAL agnostic method to first patient - agnostic model is built 
+## with entire cohort regardless of subtype.
+prediction_agnostic <- predict(agnostic_risk, p1, type="prob")
+
+## predict function returns a probability that a patient is a high or low
+## risk patient. Here we take the probability that a patient is a high risk
+## patient
+risk <- prediction_agnostic$high 
+all_results <- data.frame(model="agnostic", risk=risk, grade="C")
+
+
+```
+
+
+```{r risk_cytogenetics}
+
+## amp(1q)
+prediction_amp1q <- predict(amp1q_risk, p1, type="prob")
+all_results <- rbind(all_results, 
+                     c(model="amp(1q)", risk=prediction_amp1q$high, grade="B"))
+
+## del(13)
+prediction_del13 <- predict(del13_risk, p1, type="prob")
+all_results <- rbind(all_results,
+                     c(model="del(13)", risk=prediction_del13$high, grade="B"))
+
+## del(1p)                                          
+prediction_del1p <- predict(del1p_risk, p1, type="prob")
+all_results <- rbind(all_results,
+                     c(model="del(1p)", risk=prediction_del1p$high, grade="B")) 
+                     
+## t(4;14)                                          
+prediction_t414 <- predict(t414_risk, p1, type="prob")
+all_results <- rbind(all_results,
+                     c(model="t(4;14)", risk=prediction_t414$high, grade="A"))          
+```
+
+
+```{r risk_RNASeq}
+
+## FGFR3                                         
+prediction_fgfr3 <- predict(fgfr3_risk, p1, type="prob")
+all_results <- rbind(all_results,
+                     c(model="FGFR3", risk=prediction_fgfr3$high, grade="A")) 
+```
+
+
+```{r class}
+
+all_results %>%
+   mutate(class=dplyr::case_when(risk >= 0.6 ~ "extreme",
+                                 risk >= 0.5 ~ "high",
+                                 .default="low")) ->
+   out_results
+
+kable(out_results)
+```
+
+
