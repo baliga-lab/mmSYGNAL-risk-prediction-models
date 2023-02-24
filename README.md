@@ -12,6 +12,8 @@ or when subtype information is not obtainable.
   
 ### **mmSYGNAL risk models**    
   
+See analysis/risk_model_tutorial.nb.html for code.  
+   
 The following risk models are available.    
   
 no subtype    
