@@ -1,0 +1,552 @@
+---
+title: 'Manuscript plots: new'
+author: "Carl Murie"
+date: "`r format(Sys.Date(),'%e de %B, %Y')`"
+output: html_document 
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE)
+```
+
+
+```{r libs}
+library(knitr)
+library(here)
+library(readr)
+library(tidyverse)
+library(magrittr)
+library(stringr)
+library(tibble)
+library(data.table)
+library(ggplot2)
+library(kableExtra)
+library(RNASeqUtilities)
+library(pROC)
+library(gridExtra)
+library(survival)
+library(scales)
+library(survminer)
+library(venn)
+```
+
+```{r data}
+
+## read in ISS information
+read_csv(here("data/globalClinTraining.csv")) %>%
+  dplyr::rename(ISS=D_ISS) ->
+  iss_pheno 
+
+## gsex_risk is updated in gene_expression_panels.Rmd if you change program activity
+## in microrray_validation_miner_norm.Rmd
+## read in subtype and risk info and ensure it is ordered by risk (low to high)
+mm_risk <- read_csv(here("data/ia12_pheno_01012023.csv"))
+ 
+## GSE19784
+gse1_risk <- read_csv(here("data/validation/GSE19784_pheno_01012023.csv")) 
+
+## GSE24080
+gse2_risk <- read_csv(here("data/validation/GSE24080_pheno_01012023.csv")) 
+
+## SCCA
+scca_pheno <- read_csv(here("data/scca_risk_miner_pheno.csv"))
+
+## sensitivity and specificity 
+rate_dt <- read_csv(here::here("data/all_risk_models_summary_melt.csv"))
+  
+rate_dt$subtype <-plyr::mapvalues(rate_dt$subtype, 
+      from= c("agnostic", "del13", "del1p", "amp1q", "FGFR3", "t(4;14)"),
+      to=c("agnostic", "del(13)", "del(1p)", "amp(1q)", "FGFR3", "t(4;14)")) 
+
+rate_auc_all <- rate_dt[1:6, c(1:6)]
+
+rates <- read_csv(here("data/all_risk_models_summary.csv"))
+  
+## sky92 and gep70 panels
+gse2_gep70 <- read_csv(here("data/validation/GSE24080_gep70.csv"))
+gse2_sky92 <- read_csv(here("data/validation/GSE24080_sky92.csv"))
+
+## read in updated results for gse2
+gse2 <- read_csv(here("data/validation/GSE24080_minernorm_risk_prediction_best.csv"))
+gse2_preds <- data.frame(subject=gse2$sample, clin_risk=gse2$clin_risk, syg_risk=gse2$miner_risk, quality=gse2$miner_quality, risk_auc=gse2$auc_risk)
+
+gse1_gep70 <- read_csv(here("data/validation/GSE19784_gep70.csv"))
+gse1_sky92 <- read_csv(here("data/validation/GSE19784_sky92.csv"))
+##gse1_preds <-read_csv(here("output/validation/gse19784_risk_prediction_quality.csv"))
+## read in updated results for gse2
+gse1 <- read_csv(here("data/validation/GSE19784_minernorm_risk_prediction_best.csv"))
+gse1_preds <- data.frame(subject=gse1$sample, clin_risk=gse1$clin_risk, syg_risk=gse1$miner_risk, quality=gse1$miner_quality, risk_auc=gse1$auc_risk)
+
+ia12_sky92 <- read_csv(here("data/validation/IA12_sky92.csv"))
+ia12_gep70 <- read_csv(here("data/validation/IA12_gep70.csv"))
+
+## get updated validation data scores
+gse1_new <- read_csv(here("data/validation/GSE19784_pred_all.csv"))
+gse2_new <- read_csv(here("data/validation/GSE24080_pred_all.csv"))
+
+## panel aucs
+ia12_panel_auc <- read_csv(here("data/validation/panel_aucs_train.csv"))
+GSE_panel_auc <- read_csv(here("data/validation/panel_aucs_test.csv"))
+
+subtypes <- c("all", "del13", "del1p", "amp1q", "FGFR3", "WHSC1")
+subdirs <-  c("all", "del13", "del1p", "amp1q", "FGFR3", "t414")
+subinternal <- c("all", "del13", "del1p", "amp1q", "FGFR3", "t(4;14)")
+sublabs <-  c("agnostic", "del13", "del1p", "amp1q", "FGFR3", "t(4;14)")
+
+fac_ord <- c("t(4;14)", "FGFR3", "amp1q", "del13", "del1p", "agnostic")
+
+font_size <- 4
+font_anno <- 4
+y2 <- 0.2
+
+```
+  
+  
+```{r functions}
+
+## generate survival object
+getPFS <- function(survy, meth) {
+    labs <- sapply(str_split(names(survy$strata), "="), `[[`, 2)
+    counts <- survy$strata
+    names(counts) <- labs
+    risk <- unlist(lapply(labs, function(x, county=counts) rep(x, county[x])))
+    pfs <- data.frame(risk, PFS=survy$surv, time=survy$time, method=meth)
+    return(pfs)
+}
+   
+
+## plot KM curve - group variable must be called 'risky'
+##               - column PFS is progress free survival in months
+##               - column D_PFS_FLAG is (0,1) no relapse or relapse
+## dat: data.frame of pheno information (mm_risk)
+plotKM <- function(dat, meth="ISS", titley="IA12", coll=colss, doPlot=TRUE) {
+   
+    ## get sample size
+    n <- sum(!is.na(dat$risky))
+   
+    ## get survival plot data for each method
+    survy <- survfit(Surv(time=PFS, event=D_PFS_FLAG)~risky , data=dat)
+    survy_pval <- survdiff(Surv(time=PFS, event=D_PFS_FLAG)~ risky, data=dat)
+    pval1 <- signif(broom::glance(survy_pval)$p.value, 2)
+    pfs1 <- getPFS(survy, meth)
+    
+    
+    ## collect med pfs 50% data
+    med_pfs <- summary(survy)$table[,7]
+    risky <- sapply(str_split(names(med_pfs), "="), `[[`, 2)
+    pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                          y2=rep(0,length(med_pfs)),
+                          risk=risky)
+    rownames(pfs_tab) <- NULL
+    
+    max_x <- max(pfs1$time)
+    
+    g1 <- ggplot(pfs1, aes(x=time, y=PFS)) +
+      geom_point(aes( color=risk)) + 
+      geom_step(aes(color=risk)) +
+        scale_color_manual(values=coll) +
+        theme_classic() +
+        theme(legend.justification=c(1,1), legend.position=c(1,1),
+              legend.background=element_rect(fill="transparent"),
+              text = element_text(size=10),
+              axis.title = element_text(size = 10),
+              plot.title = element_text(size = 10)) + 
+        xlab("PFS (months)") + ylab("survival probability") +
+        ylim(0,1) +
+        ggtitle(paste0(titley, ": ", meth  ," p-value: ", pval1)) +
+        geom_text(x=max_x/2, y=1, label=paste("n=", n)) +
+        geom_hline(yintercept = 0.5, linetype="dotted") +
+        geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2,
+                     color=risky), linetype="dashed") + labs(color="Risk factor") +
+      guides(color=guide_legend(order=1))
+    
+    if(doPlot) {
+       print(g1)
+    }
+    
+    pfs_tab$method <- meth
+    pfs_tab$data <- titley
+    return(list(data=pfs1, med_pfs=pfs_tab, pval=pval1, plot=g1))
+}
+
+```
+  
+## **Data sets**  {.tabset .tabset-pills}  
+
+### **IA12**
+  
+```{r iss}
+ia12_all <- NULL
+med_all <- NULL
+DOPLOT=FALSE
+
+## ISS
+mm_risk$risky <- mm_risk$ISS
+res_iss <- plotKM(mm_risk,  meth="ISS", titley="IA12", coll=c("blue", "green", "red"), doPlot=DOPLOT)
+ia12_all <- rbind(ia12_all, data.frame(res_iss[["data"]], data="IA12")) 
+med_all <- rbind(med_all, res_iss[["med_pfs"]])
+
+mm_risk$ISS_auc <- plyr::mapvalues(mm_risk$ISS, from=c(1,2,3), to=c(3,2,1))
+rocc <- roc(response=mm_risk$risk_auc, predictor=mm_risk$ISS_auc, plot=TRUE,
+            direction=">")
+iss_auc <- signif(auc(rocc)[1],3)
+roc_dat <- data.frame(FPR=rev(1-rocc$specificities), TPR=rev(rocc$sensitivities))
+iss_roc <- data.frame(roc_dat, method="ISS")
+
+
+## plot ISS to get legend
+print(res_iss[["plot"]])
+ggsave(file=here("output/KM_val_ISS.pdf"))
+
+## SYGNAL
+mm_risk$risky <- mm_risk$syg_class
+res_syg <- plotKM(mm_risk,  meth="mmSYGNAL", titley="IA12", coll=c("red", "green", "blue"), doPlot=DOPLOT)
+ia12_all <- rbind(ia12_all, data.frame(res_syg[["data"]], data="IA12"))
+med_all <- rbind(med_all, res_syg[["med_pfs"]])
+
+## SKY92
+mm_risk$risky <- mm_risk$sky92_class
+res_sky <- plotKM(mm_risk,  meth="SKY92", titley="IA12", coll=c("green", "blue"), doPlot=DOPLOT)
+ia12_all <- rbind(ia12_all, data.frame(res_sky[["data"]], data="IA12"))
+med_all <- rbind(med_all, res_sky[["med_pfs"]])
+
+## GEP70
+mm_risk$risky <- mm_risk$gep70_class
+res_gep <- plotKM(mm_risk,  meth="GEP70", titley="IA12", coll=c("green", "blue"), doPlot=DOPLOT)
+ia12_all <- rbind(ia12_all, data.frame(res_gep[["data"]], data="IA12"))
+med_all <- rbind(med_all, res_gep[["med_pfs"]])
+
+iss_tab <- res_iss$med_pfs[3:1,c(4,1)]
+colnames(iss_tab) <- c("ISS class", "ISS")
+pfs_tab <- data.frame(risk=res_syg$med_pfs[,4],
+                      mmSYGNAL=res_syg$med_pfs[,1],
+                      SKY92=c(NA, res_sky$med_pfs[,1]),
+                      GEP70=c(NA, res_gep$med_pfs[,1]))
+out_tab <- cbind(pfs_tab, iss_tab)
+
+grid.arrange(grobs=list(res_syg$plot, res_sky$plot, res_gep$plot, res_iss$plot), ncol=2, nrow=2)
+```
+  
+`r headerKable(out_tab)`  
+
+```{r venn_ia12}
+
+high_count <- list(mmSYGNAL=mm_risk$sample[mm_risk$syg_class!="low"],
+                  GEP70=mm_risk$sample[mm_risk$gep70_class!="low"],
+                  SKY92=mm_risk$sample[mm_risk$sky92_class!="low"],
+                  ISS=mm_risk$sample[mm_risk$ISS != 1])
+
+venn(high_count, sncs=1, ilcs=1.5, zcolor="style")
+```
+
+```{r ia12_cut}
+mm_risk %>%
+  group_by(risk) %>%
+  summarize(min=min(PFS), max=max(PFS)) ->
+  tmp
+print(tmp)
+  
+ggplot(mm_risk, aes(x=risk, y=PFS)) + geom_violin() + geom_jitter(aes(color=relapse), width=0.1, size=0.75) +
+  ggtitle("PFS by clinical risk group") + 
+  ylab("PFS (months)") + xlab("clinical risk")
+```
+
+### **GSE19784**
+  
+```{r gse1}
+gse1_all <- NULL
+DOPLOT=FALSE
+
+## ISS
+gse1_risk$risky <- gse1_risk$ISS
+res_iss <- plotKM(gse1_risk,  meth="ISS", titley="GSE19784", coll=c("blue", "green", "red"), doPlot=DOPLOT)
+gse1_all <- rbind(gse1_all, data.frame(res_iss[["data"]], data="GSE19784"))
+med_all <- rbind(med_all, res_iss[["med_pfs"]])
+
+gse1_risk$ISS_auc <- plyr::mapvalues(gse1_risk$ISS, from=c(1,2,3), to=c(3,2,1))
+rocc <- roc(response=gse1_risk$risk_auc, predictor=gse1_risk$ISS_auc, plot=TRUE,
+            direction=">")
+iss_auc <- signif(auc(rocc)[1],3)
+
+## SYGNAL
+gse1_risk$risky <- gse1_risk$syg_class
+res_syg <- plotKM(gse1_risk,  meth="mmSYGNAL", titley="GSE19784", coll=c("red", "green", "blue"), doPlot=DOPLOT)
+gse1_all <- rbind(gse1_all, data.frame(res_syg[["data"]], data="GSE19784"))
+med_all <- rbind(med_all, res_syg[["med_pfs"]])
+
+## SKY92
+gse1_risk$risky <- gse1_risk$sky92_class
+res_sky <- plotKM(gse1_risk,  meth="SKY92", titley="GSE19784", coll=c("green", "blue"), doPlot=DOPLOT)
+gse1_all <- rbind(gse1_all, data.frame(res_sky[["data"]], data="GSE19784"))
+med_all <- rbind(med_all, res_sky[["med_pfs"]])
+
+## GEP70
+gse1_risk$risky <- gse1_risk$gep70_class
+res_gep <- plotKM(gse1_risk,  meth="GEP70", titley="GSE19784", coll=c("green", "blue"), doPlot=DOPLOT)
+gse1_all <- rbind(gse1_all, data.frame(res_gep[["data"]], data="GSE19784"))
+med_all <- rbind(med_all, res_gep[["med_pfs"]])
+
+iss_tab <- res_iss$med_pfs[3:1,c(4,1)]
+colnames(iss_tab) <- c("ISS class", "ISS")
+pfs_tab <- data.frame(risk=res_syg$med_pfs[,4],
+                      mmSYGNAL=res_syg$med_pfs[,1],
+                      SKY92=c(NA, res_sky$med_pfs[,1]),
+                      GEP70=c(NA, res_gep$med_pfs[,1]))
+out_tab <- cbind(pfs_tab, iss_tab)
+
+grid.arrange(grobs=list(res_syg$plot, res_sky$plot, res_gep$plot, res_iss$plot), ncol=2, nrow=2)
+```
+  
+`r headerKable(out_tab)`  
+
+```{r venn_gse1}
+
+high_count <- list(mmSYGNAL=gse1_risk$sample[gse1_risk$syg_class!="low"],
+                  GEP70=gse1_risk$sample[gse1_risk$gep70_class!="low"],
+                  SKY92=gse1_risk$sample[gse1_risk$sky92_class!="low"],
+                  ISS=gse1_risk$sample[gse1_risk$ISS != 1])
+
+venn(high_count, sncs=1, ilcs=1.5, zcolor="style")
+```
+
+```{r gse1_cut}
+gse1_risk %>%
+  group_by(risk) %>%
+  summarize(min=min(PFS), max=max(PFS)) ->
+  tmp
+print(tmp)
+
+ggplot(gse1_risk, aes(x=risk, y=PFS)) + geom_violin() + 
+  geom_jitter(aes(color=relapse), width=0.1, size=0.75) +
+  ggtitle("PFS by clinical risk group") + 
+  ylab("PFS (months)") + xlab("clinical risk")
+```
+
+
+### **GSE24080**
+  
+```{r gse2}
+gse2_all <- NULL
+DOPLOT=FALSE
+
+## ISS
+gse2_risk$risky <- gse2_risk$ISS
+res_iss <- plotKM(gse2_risk,  meth="ISS", titley="GSE24080", coll=c("blue", "green", "red"), doPlot=DOPLOT)
+gse2_all <- rbind(gse2_all, data.frame(res_iss[["data"]], data="GSE24080"))
+med_all <- rbind(med_all, res_iss[["med_pfs"]])
+
+gse2_risk$ISS_auc <- plyr::mapvalues(gse2_risk$ISS, from=c(1,2,3), to=c(3,2,1))
+rocc <- roc(response=gse2_risk$risk_auc, predictor=gse2_risk$ISS_auc, plot=TRUE,
+            direction=">")
+iss_auc <- signif(auc(rocc)[1],3)
+
+
+## SYGNAL
+gse2_risk$risky <- gse2_risk$syg_class
+res_syg <- plotKM(gse2_risk,  meth="mmSYGNAL", titley="GSE24080", coll=c("red", "green", "blue"), doPlot=DOPLOT)
+gse2_all <- rbind(gse2_all, data.frame(res_syg[["data"]], data="GSE24080"))
+med_all <- rbind(med_all, res_syg[["med_pfs"]])
+
+## SKY92
+gse2_risk$risky <- gse2_risk$sky92_class
+res_sky <- plotKM(gse2_risk,  meth="SKY92", titley="GSE24080", coll=c("green", "blue"), doPlot=DOPLOT)
+gse2_all <- rbind(gse2_all, data.frame(res_sky[["data"]], data="GSE24080"))
+med_all <- rbind(med_all, res_sky[["med_pfs"]])
+
+## GEP70
+gse2_risk$risky <- gse2_risk$gep70_class
+res_gep <- plotKM(gse2_risk,  meth="GEP70", titley="GSE24080", coll=c("green", "blue"), doPlot=DOPLOT)
+gse2_all <- rbind(gse2_all, data.frame(res_gep[["data"]], data="GSE24080"))
+med_all <- rbind(med_all, res_gep[["med_pfs"]])
+
+iss_tab <- res_iss$med_pfs[3:1,c(4,1)]
+colnames(iss_tab) <- c("ISS class", "ISS")
+pfs_tab <- data.frame(risk=res_syg$med_pfs[,4],
+                      mmSYGNAL=res_syg$med_pfs[,1],
+                      SKY92=c(NA, res_sky$med_pfs[,1]),
+                      GEP70=c(NA, res_gep$med_pfs[,1]))
+out_tab <- cbind(pfs_tab, iss_tab)
+
+grid.arrange(grobs=list(res_syg$plot, res_sky$plot, res_gep$plot, res_iss$plot), ncol=2, nrow=2)
+```
+  
+`r headerKable(out_tab)`  
+
+
+```{r venn_gse2}
+
+high_count <- list(mmSYGNAL=gse2_risk$sample[gse2_risk$syg_class!="low"],
+                  GEP70=gse2_risk$sample[gse2_risk$gep70_class!="low"],
+                  SKY92=gse2_risk$sample[gse2_risk$sky92_class!="low"],
+                  ISS=gse2_risk$sample[gse2_risk$ISS != 1])
+
+venn(high_count, sncs=1, ilcs=1.5, zcolor="style")
+```
+
+```{r gse2_cut}
+gse2_risk %>%
+  group_by(risk) %>%
+  summarize(min=min(PFS), max=max(PFS)) ->
+  tmp
+print(tmp)
+  
+ggplot(gse2_risk, aes(x=risk, y=PFS)) + geom_violin() + 
+  geom_jitter(aes(color=relapse), width=0.1, size=0.75) +
+  ggtitle("PFS by clinical risk group") + 
+  ylab("PFS (months)") + xlab("clinical risk")
+```
+
+### **SCAA**
+  
+```{r scca}
+
+DOPLOT=FALSE
+
+scca_pheno %>%
+   mutate(PFS=PFS_real/30) %>%
+   mutate(D_PFS_FLAG=plyr::mapvalues(relapse, from=c(TRUE, FALSE), to=c(1,0))) ->
+   scca_pheno
+
+## ISS
+scca_pheno$risky <- scca_pheno$Stage
+res_iss <- plotKM(scca_pheno,  meth="ISS", titley="SCCA: ISS", coll=c("blue", "green", "red"), doPlot=DOPLOT)
+
+print(res_iss[["plot"]])
+ggsave(here("output/man_scca_ISS_KM.pdf"), device="pdf")
+
+## SYGNAL
+scca_pheno$risky <- scca_pheno$miner_class
+res_syg <- plotKM(scca_pheno,  meth="mmSYGNAL", titley="SCCA: mmSYGNAL", coll=c("red", "green", "blue"), doPlot=DOPLOT)
+
+iss_tab <- res_iss$med_pfs[3:1,c(4,1)]
+colnames(iss_tab) <- c("ISS class", "ISS")
+pfs_tab <- data.frame(risk=res_syg$med_pfs[,4],
+                      mmSYGNAL=res_syg$med_pfs[,1])
+out_tab <- cbind(pfs_tab, iss_tab)
+
+grid.arrange(grobs=list(res_syg$plot, res_iss$plot), ncol=2, nrow=2)
+```
+  
+`r headerKable(out_tab)`  
+
+### **All**  
+  
+```{r all}
+
+## collect all KM plot data
+rbind(ia12_all, gse1_all, gse2_all) %>%
+  mutate(risk=plyr::mapvalues(risk, from=c(1,2,3), to=c("low", "high", "extreme"))) %>%
+  mutate(method=factor(method, levels=c("mmSYGNAL", "SKY92", "GEP70", "ISS"), ordered=TRUE)) %>%
+  mutate(data=factor(data, levels=c("IA12", "GSE19784", "GSE24080"))) ->
+  all_dat
+
+## format ISS values for med PFS
+med_all$risk <- plyr::mapvalues(med_all$risk, from=c(1,2,3), to=c("low", "high", "extreme"))
+
+
+colls <- c("red", "green", "blue")
+
+ggplot(all_dat, aes(x=time, y=PFS)) +
+    geom_point(aes(color=risk), size=0.5) + 
+    geom_step(aes(color=risk)) +
+    ##facet_grid(rows=fct_relevel(method, "mmSYGNAL", "SKY92", "GEP70", "ISS"), cols=data, switch="y", scales="free", space="free") +
+    facet_grid(fct_relevel(method, "mmSYGNAL", "SKY92", "GEP70", "ISS")~fct_relevel(data, "IA12", "GSE19784", "GSE24080"), switch="y", scales="free", space="free") +
+      scale_color_manual(values=colls) +
+      theme_bw() +
+      theme(legend.justification=c(1,1), legend.position=c(1,1),
+            legend.background=element_rect(fill="transparent"),
+            text = element_text(size=14),
+            axis.title = element_text(size = 14),
+            plot.title = element_text(size = 14),
+            strip.background = element_rect(color="black", fill="white")) + 
+      xlab("PFS (months)") + ylab("survival probability") +
+      ylim(0,1) +
+     geom_hline(yintercept = 0.5, linetype="dotted") +
+     geom_segment(data=med_all, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2,
+                 color=risk), linetype="dashed") +
+  guides(color=FALSE)
+
+ggsave(file=here("output/KM_val_all.pdf"))
+
+```
+
+## ISS and cytogenetics PFS and OS
+
+```{r dist}
+
+cyto <- rbind(data.frame(mm_risk[,c("sample", "cyto_count", "relapse")], type="PFS", data=mm_risk$PFS),
+              data.frame(mm_risk[,c("sample", "cyto_count", "relapse")], type="OS", data=mm_risk$OS))
+cyto$cyto_count <- factor(cyto$cyto_count)
+
+ggplot(cyto, aes(x=cyto_count, y=data)) + geom_violin() +
+  geom_jitter(width=0.2, size=0.75, aes(color=relapse)) +
+  facet_wrap(~type, scales="free_x") + 
+  xlab("Number of high risk genetic abnormalities") + ylab("time (months)") +
+     theme_bw() +
+      theme(legend.justification=c(1,1), legend.position=c(1,1),
+            legend.background=element_rect(fill="transparent"),
+            text = element_text(size=16),
+            axis.title = element_text(size = 14),
+            plot.title = element_text(size = 14),
+            strip.background = element_rect(color="black", fill="white")) +
+   guides(colour = guide_legend(override.aes = list(size=5)))
+
+ggsave(here("output/cyto_PFS_OS.pdf"), device="pdf")
+
+iss <- rbind(data.frame(mm_risk[,c("sample", "ISS", "relapse")], type="PFS", data=mm_risk$PFS, set="IA12"),
+              data.frame(mm_risk[,c("sample", "ISS", "relapse")], type="OS", data=mm_risk$OS, set="IA12"),
+              data.frame(gse1_risk[,c("sample", "ISS", "relapse")], type="PFS", data=gse1_risk$PFS, set="GSE19784"),
+              data.frame(gse1_risk[,c("sample", "ISS", "relapse")], type="OS", data=gse1_risk$OS, set="GSE19784"),
+              data.frame(gse2_risk[,c("sample", "ISS", "relapse")], type="PFS", data=gse2_risk$PFS, set="GSE24080"),
+              data.frame(gse2_risk[,c("sample", "ISS", "relapse")], type="OS", data=gse2_risk$OS, set="GSE24080"))
+iss %>%
+  dplyr::mutate(ISS=plyr::mapvalues(ISS, from=c(1,2,3), to=c("I", "II", "III"))) %>%
+  dplyr::mutate(relapse=plyr::mapvalues(relapse, from=c(0,1), to=c("no", "yes"))) %>%
+  dplyr::filter(!is.na(ISS)) %>%
+  dplyr::mutate(data=factor(data, levels=c("IA12", "GSE19784", "GSE24080"))) ->
+  iss
+
+ggplot(iss, aes(x=ISS, y=data)) + geom_violin() +
+  geom_jitter(width=0.2, size=0.75, aes(color=relapse)) +
+  facet_grid(set~type, switch="y", scales="free_y") +
+  theme_bw() +
+  theme(legend.background=element_rect(fill="transparent"),
+            text = element_text(size=16),
+            axis.title = element_text(size = 14),
+            plot.title = element_text(size = 14),
+            strip.background = element_rect(color="black", fill="white")) +
+   guides(colour = "none")
+  ggsave(here("output/ISS_PFS_OS.pdf"), device="pdf")
+```
+
+
+## Guan Score  
+  
+```{r guan}
+
+samp_mid <- sum(mm_risk$risk == "low")
+
+mm_risk %<>%
+  dplyr::mutate(risk_lab=plyr::mapvalues(risk, from=c("extreme", "high", "low"), 
+                                         to=c(paste("extreme: n=", sum(risk=="extreme")),
+                                              paste("high: n=", sum(risk=="high")),
+                                              paste("low: n=", sum(risk=="low"))))) 
+  
+ggplot(mm_risk, aes(y=GuanScore, x=length(GuanScore):1)) + geom_point(aes(color=risk_lab)) +
+  xlab("Subjects") + ylab("Guan score") + ggtitle("Ordered Guan score") +
+  geom_vline(xintercept=samp_mid, linetype="dotted") +
+  geom_hline(yintercept=0.5, linetype="dotted") +
+  guides(color = guide_legend(title = "Risk class") )+
+  theme(legend.position = c(0.3, 0.8),
+        legend.text = element_text (size = 15),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=15),
+        title=element_text(size=16),
+        ##axis.text.x = element_text (angle = 90),
+        plot.margin = margin(0.1,0.5,0.1,0.1, "cm"))
+        
+ggsave(file=here("output/guan_score.pdf"))
+
+```
+

@@ -1,0 +1,2238 @@
+---
+title: "Drug Sensitivity Heat maps"
+author: "Carl Murie"
+date: "`r format(Sys.Date(),'%e de %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE)
+options(knitr.duplicate.label = "allow")
+```
+
+```{r libraries}
+library(tidyverse)
+library(knitr)
+library(here)
+library(readr)
+library(magrittr)
+library(stringr)
+library(tibble)
+library(data.table)
+library(ggplot2)
+library(kableExtra)
+library(gridExtra)
+library(survival)
+library(jsonlite)
+library(caret)
+library(ComplexHeatmap)
+library(htmltools)
+library(DT)
+library(matrixStats)
+library(RNASeqUtilities)
+library(ggpubr)
+library(survminer)
+library(randomcoloR)
+
+source(here("code/utilities.R"))
+source(here("code/utilities_drug.R"))
+source(here("code/drug_therapy_functions.R"))
+```
+  
+  
+```{r load}
+
+## mmSYGNAL prog/reg/gene definitions
+gen_sym <- read_csv(here("data/prog_def_full_regs.csv"))
+##view(data.frame(gene=unique(gen_sym$SYMBOL)))
+
+## drug constrained network activity is generated with getDrugTherapyActivity 
+## in utilities_drug.R
+## drug_information_processing_updated - file where DCNA is generated
+
+## read in drug pheno data
+drug_pheno <- read_csv(here("data/drug_map_me_to_patient_v3.csv")) 
+
+## read in drug category information
+drug_cat <- read_csv(here("data/manuscript_drug_mechanism.csv"))
+
+## join data
+drug_pheno %<>% dplyr::left_join(drug_cat[, -2], by="Drug") 
+
+## get regulon definitions
+mm_sym <- read_csv(here("data/prog_def_full_regs.csv"))
+
+mm_risk <- read_csv(here("data/ia12_pheno_01012023.csv")) 
+mm_risk %<>% dplyr::arrange(GuanScore)
+
+library(circlize)
+col_fun = colorRamp2(c(-2/3, 0, 0.9), c("blue", "white", "red")) 
+
+```
+
+
+```{r function}
+
+## calculate deciles of a row of gene expression 
+## exp - vector of gene expression  
+## n - number of quantiles  
+## returns running mean of lengths ~ length(exp)/n 
+getPieceWiseMean <- function(exp, n=10) {
+  splits <- splitIndices(length(exp), n)
+  sapply(splits, function(x, nums=exp) return(mean(nums[x])))
+}
+
+## calculate mean of vector based on predicted risk status
+## vec: vector of dcna for a drug
+## pheno: mm phenotype file (mm_risk)
+getPredictedRiskMean <- function(vec, phen=mm_risk) {
+   
+   phen %>%
+      dplyr::filter(sample %in% names(vec)) %>% 
+      dplyr::select(sample, syg_class) ->
+      risky
+   
+   data.frame(sample=names(vec), dcna=vec) %>%
+      dplyr::left_join(risky) ->
+      tmpy
+   
+   res <- tapply(tmpy$dcna, tmpy$syg_class, mean)
+   
+   ## format to account for missing risk values
+   data.frame(risk=c("low", "high", "extreme")) %>%
+      left_join(data.frame(risk=names(res), dcna=res)) ->
+      outie
+   
+   res1 <- outie$dcna
+   names(res1) <- outie$risk
+
+   return(res1)
+   
+}
+
+## reorder DCNA by subtype and mmSYGNAL risk classification 
+getRiskOrder <- function(mat, risky=mm_risk) {
+   
+   subs <- c("none", "del13", "del1p", "amp1q", "WHSC1")
+   
+   if(sum(risky$sample != colnames(mat)[-1]) >0 ) {
+      stop("getRiskOrder: mat and risky are not ordered the same") 
+   }
+   
+   ## order by mmSYGNAL risk classification 
+   risky %>%
+      dplyr::mutate(syg_class=factor(syg_class, levels=c("low", "high", "extreme"),
+                                     ordered=TRUE)) %>%
+      dplyr::arrange(syg_class) ->
+      risk_order
+   
+   outie <- data.frame(Drug=mat$Drug)
+   for(s in subs) {
+      indy <- risk_order$sample[risk_order[,s]==1] 
+      outie <- cbind(outie, mat[,indy])
+   }
+   return(outie)
+   
+}
+
+```
+
+RajKumar, 2022 
+
+Drugs missing in mmSYGNAL. 
+Cyclophosphamide - NR1I2. 
+Isatuximab - CD38. 
+
+Monoclonal antibodies: CD38 and SLAM7 are not present in mmSYGMAL
+  
+1. daratumumab and isatuximab target CD38. 
+  
+2. elotuzumab targets SLAM7. 
+  
+3. BELANTAMAB MAFODOTIN targets TUBB1, TUBB2A, TUBB2B, TUBB3, TUBB4A, TUBB4B, TUBB6. 
+  
+4. IXAZOMIB CITRATE targets PSMB5
+
+
+```{R druggies}
+
+## get table of drugs with pheno info. IKZF1, IKZF2 are ImiDs and 
+## not in our drug phenotype 
+## CRBN - Lenalidome, Thalidomide, Palidomide
+## NR3C1 - DEXAMETHASONE 
+## IKZF1 and IKZF3 are transcription factors and downstream targets of 
+## Lenalidomide and Thalidomide
+wall_soc <- c("CRBN", "IKZF1", "IKZF3", "NR3C1", "PSMB5") 
+
+## missing in drug pheno: KIF11, AURKA, AURKB, ANPEP
+wall_rr <- c("HDAC6", "APH1A", "PARP1", "KIF11", "GSK3B", "AURKA", "AURKB", 
+                 "HDAC1", "HDAC2", "ANPEP")
+
+## Rajkumar 2022, soc and relapse/refractory drugs
+## VrD, Dara-Vrd, Drd
+soc_raj <- c("BORTEZOMIB", "THALIDOMIDE", "DEXAMETHASONE", "LENALIDOMIDE", 
+             "DARATUMUMAB") 
+
+## DrD, KrD, EpD, IRD, DkD, Isa-Kd, DPd, Isa-Pd. KcD, KPd, VCd, EPd, Belantamab,
+## Bendamustine, Venetocals, Anthracycline
+rr_raj <- c("ELOTUZUMAB", "IXAZOMIB CITRATE", "ISATUXIMAB", "POMALIDOMIDE", "CARFILZOMIB",
+            "SELINEXOR", "ISATUXIMAB", "DOXORUBICIN", "VENETOCLAX", "BELANTAMAB MAFODOTIN") 
+
+
+## drugs from Pinto et al, 2020 not contained in wall drugs
+## melphalan - alkylyting agent targets DNA
+## ixazomib - proteseame inhibitor - PSMB5
+## daratumumab - monoclonal antibody - CD38
+## elotuzuzmab - monoclonal antibody - SLAMF7
+## selinexor - nuclear export inhibitor - XPO1 
+pinto_drugs <- c("MELPHALAN", "IXAZOMIB", "DARATUMUMAB", "ELOTUZUMAB", "SELINEXOR")
+
+## anti-BCMA drugs 
+## IDECABTAGENE VICLEUCEL TNFRSF17 (BCMA - alternative name)
+## CILTACABTAGENE AUTOLEUC TNFRSF17
+parp_drugs <- c("NIRAPARIB", "OLAPARIB", "TALAZOPARIB")
+
+
+```
+
+```{r wall_drugs, eval=FALSE}
+
+## Legacy drug collections - revised in raj_drugs below 
+drug_pheno %>%
+   dplyr::filter(TargetSymbol %in% wall_soc) %>%
+   dplyr::select(Drug, TargetSymbol, MM_Phase, Cancer_PhaseIV, soc, rr) %>%
+   distinct() ->
+   wall_soc_drugs
+
+drug_pheno %>%
+   dplyr::filter(soc==TRUE) %>%
+   dplyr::select(Drug, TargetSymbol, MM_Phase, Cancer_PhaseIV, soc, rr) %>%
+   distinct() ->
+   soc_drugs
+
+drug_pheno %>%
+   dplyr::filter(rr==TRUE) %>%
+   dplyr::select(Drug, TargetSymbol, MM_Phase, Cancer_PhaseIV, soc, rr) %>%
+   distinct() ->
+   rr_drugs
+
+drug_pheno %>%
+   dplyr::filter(TargetSymbol %in% pinto_drugs) %>%
+   dplyr::select(Drug, TargetSymbol, MM_Phase, Cancer_PhaseIV, soc, rr) %>%
+   distinct() ->
+   pinto_drugs
+
+## drug targets missing in drug_pheno but are in wall_soc
+dif_soc <- setdiff(wall_soc, sort(unique(soc_drugs$TargetSymbol)))
+
+## drug targets missing in drug_pheno but are in wall_rr
+dif_rr <- setdiff(wall_rr, sort(unique(rr_drugs$TargetSymbol)))
+
+## drug targets missing in drug_pheno but are in pinto_drugs
+## these targets are not in mmSYGNAL
+dif_pinto <-  c("CD38", "SLAMF7", "XPO1")
+
+## all drug targets missing from drug_pheno
+all_new_targs <- c(dif_soc, dif_rr)
+
+```
+
+```{r raj_drugs, eval=TRUE}
+
+## read in drug 
+
+## soc drugs
+drug_pheno %>%
+   dplyr::filter(Drug %in% soc_raj) %>%
+   dplyr::select(Drug, TargetSymbol, effect, MM_Phase, Cancer_PhaseIV, soc, rr, 
+                 type, treatment) %>%
+   distinct() ->
+   soc_drugs
+
+## drug targets missing in drug_pheno but are in wall_soc
+dif_soc <- setdiff(wall_soc, sort(unique(soc_drugs$TargetSymbol)))
+
+## raj rr drugs - add this to rr-drugs
+drug_pheno %>%
+   dplyr::filter(Drug %in% rr_raj) %>%
+   dplyr::select(Drug, TargetSymbol, effect, MM_Phase, Cancer_PhaseIV, soc, rr, 
+                 type, treatment) %>%
+   distinct() ->
+   raj_rr_drugs
+
+## wall rr drugs based on drug target - 
+drug_pheno %>%
+   dplyr::filter(TargetSymbol %in% wall_rr) %>%     
+   dplyr::filter(soc | rr) %>%                ## make sure they're soc or rr
+   dplyr::filter(!(Drug %in% unique(soc_drugs$Drug))) %>% ## avoid overlap
+   dplyr::select(Drug, TargetSymbol, effect, MM_Phase, Cancer_PhaseIV, soc, rr, 
+                 type, treatment) %>%
+   distinct() ->
+   wall_rr_drugs
+
+rr_drugs <- raj_rr_drugs
+
+## get all mm related drugs not in soc or rr drugs
+drug_pheno %>%
+  dplyr::filter(MM_Phase >=2) %>%
+  dplyr::filter(soc | rr | (Drug %in% unique(wall_rr_drugs$Drug))) %>%
+  dplyr::filter(!(Drug %in% unique(soc_drugs$Drug))) %>%
+  dplyr::filter(!(Drug %in% unique(rr_drugs$Drug))) %>%
+  dplyr::select(Drug, TargetSymbol, effect, MM_Phase, Cancer_PhaseIV, soc, rr, 
+                 type, treatment) ->
+  rr_plus
+
+## get all PARP drugs
+drug_pheno %>%
+   dplyr::filter(Drug %in% parp_drugs) %>%
+   dplyr::select(Drug, TargetSymbol, effect, MM_Phase, Cancer_PhaseIV, soc, rr, 
+                 type, treatment) ->
+   rr_parp
+
+## add parp drugs to rr_plus
+rr_plus <- rbind(rr_plus, rr_parp) 
+
+## combine all drugs 
+all_drugs <- rbind(soc_drugs, rr_drugs, rr_plus, rr_parp) %>%
+  dplyr::select(Drug, TargetSymbol, effect, MM_Phase, Cancer_PhaseIV) %>%
+  dplyr::distinct()
+ 
+
+## identify wall drug targets not included in the drug files
+wall_rr_targs <- setdiff(wall_rr, c(unique(rr_plus$TargetSymbol), 
+                                    unique(raj_rr_drugs$TargetSymbol)))
+```
+
+
+# IA12 
+
+## Gather program/regulon activity and drug network activity. 
+  
+```{r ia12_load}
+
+################################### IA12 #####################################
+## get IA12 pheno file
+read_csv(here("data/decision_tree_risk.csv")) %>%
+  dplyr::arrange(GuanScore) ->
+  ia12_pheno
+ia12_pheno <- mm_risk
+
+## read IA12 regulon and program activity and extract newly diagnosed patients
+ia12_reg <- read_csv(here("data/IA12_regulon_activity.csv"))
+reg_indy <- str_detect(colnames(ia12_reg), pattern="_1_")
+ia12_reg <- data.frame(Regulon=ia12_reg$X1, ia12_reg[, reg_indy])
+
+## read IA12 regulon and program activity and extract newly diagnosed patients
+ia12_prog <- read_csv(here("data/program_activity_py.csv"))
+colnames(ia12_prog)[1] <- "Program"
+prog_indy <- str_detect(colnames(ia12_prog), pattern="_1_")
+ia12_prog <- data.frame(Program=ia12_prog[,1], ia12_prog[, prog_indy])
+
+## get IA12 DCRA and extract newly diagnosed patients
+ia12_dca_reg <- read_csv(here("data/ia12_drug_therapy_regulon.csv"))
+reg_indy <- str_detect(colnames(ia12_dca_reg), pattern="_1_")
+ia12_dca_reg <- data.frame(Drug=ia12_dca_reg$Drug, ia12_dca_reg[, reg_indy])
+
+## get IA12 DCPA and extract newly diagnosed patients
+ia12_dca_prog <- read_csv(here("data/ia12_drug_therapy_program.csv"))
+prog_indy <- str_detect(colnames(ia12_dca_prog), pattern="_1_")
+ia12_dca_prog <- data.frame(Drug=ia12_dca_prog$Drug, ia12_dca_prog[, prog_indy])
+
+## list subtype names (mm_risk) and labels (for output) 
+subtypes <- c("none", "del13", "del1p", "amp1q", "WHSC1")
+sublabs <-  c("none", "del(13)", "del(1p)", "amp(1q)", "t(4;14)")
+```
+  
+## Calculate network activity for drug targets not in drug pheno file
+  
+```{r targets}
+
+dcra <- dcpa <- NULL
+for(t in c(dif_soc, wall_rr_targs)) {
+
+   ## extract program/regulon for this drug target
+   mm_sym %>%
+      dplyr::filter(SYMBOL == t) %>%
+      dplyr::select(program, regulon, SYMBOL) ->
+      sym_t
+   
+   ## calculate drug constrained regulon activity 
+   ia12_reg %>%
+      dplyr::filter(Regulon %in% sym_t$regulon) ->
+   t_reg 
+
+   d1 <-  t(data.frame(apply(t_reg[,-1], 2, mean,na.rm=TRUE)))
+   dc <- data.frame(Drug=t, d1)
+   rownames(dc) <- NULL
+   dcra <- rbind(dcra, dc)
+   
+   ## calculate drug constrained program activity 
+   ia12_prog %>%
+      dplyr::filter(Program %in% sym_t$program) ->
+   t_prog 
+
+   d1 <-  t(data.frame(apply(t_prog[,-1], 2, mean,na.rm=TRUE)))
+   dc <- data.frame(Drug=t, d1)
+   rownames(dc) <- NULL
+   dcpa <- rbind(dcpa, dc)
+   
+}
+
+
+```
+
+## IA12: extract soc drug activity
+
+```{r soc_ia12}
+
+############################ SOC ##################################
+## soc drugs from drug_pheno
+soc_drugnames <- sort(unique(soc_drugs$Drug)) 
+
+##  dc regulon activity - drug_pheno
+ia12_dca_reg %>%
+   dplyr::filter(Drug %in% soc_drugnames) -> 
+   soc_dcr
+
+## dc regulon activity - wall
+dcra %>%
+   dplyr::filter(Drug %in% dif_soc) ->
+   gene_soc
+
+## combine both 
+##soc_dcr <- rbind(soc_dcr, gene_soc) 
+soc_drug_labs <- soc_dcr$Drug
+
+## order by risk - low -> high
+soc_dcr <- data.frame(Drug=soc_dcr$Drug, soc_dcr[, mm_risk$sample])
+
+## store for later heatmap
+all_dcr <- soc_dcr
+
+## order by chromosomal abnormalities
+probb <- seq(0.05, 0.95, 0.1)
+soc_labs_12 <- factor(rep(sublabs, each=10), ordered=TRUE, levels=sublabs)
+soc_plot <- data.frame(Drug=soc_dcr$Drug, 
+                       t(apply(soc_dcr[,mm_risk$sample[mm_risk$none==1]], 1, getPieceWiseMean)),
+                        t(apply(soc_dcr[,mm_risk$sample[mm_risk$del13==1]], 1, getPieceWiseMean)),
+                        t(apply(soc_dcr[,mm_risk$sample[mm_risk$del1p==1]], 1, getPieceWiseMean)),
+                        t(apply(soc_dcr[,mm_risk$sample[mm_risk$amp1q==1]], 1, getPieceWiseMean)),
+                        t(apply(soc_dcr[,mm_risk$sample[mm_risk$WHSC1==1]], 1, getPieceWiseMean)))
+
+tmp <- data.frame(pid=colnames(soc_plot))
+
+soc_heat_12 <- as.matrix(soc_plot[,-1])
+rownames(soc_heat_12) <- soc_plot$Drug
+
+soc_ia12 <- Heatmap(soc_heat_12,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = soc_labs_12,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 5))
+##draw(soc_ia12) 
+
+
+### generate DCNA by risk class
+soc_plot_risk <- data.frame(Drug=soc_dcr$Drug, 
+                       t(apply(soc_dcr[,mm_risk$sample[mm_risk$none==1]], 1, 
+                               getPredictedRiskMean)),
+                        t(apply(soc_dcr[,mm_risk$sample[mm_risk$del13==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(soc_dcr[,mm_risk$sample[mm_risk$del1p==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(soc_dcr[,mm_risk$sample[mm_risk$amp1q==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(soc_dcr[,mm_risk$sample[mm_risk$WHSC1==1]], 1, 
+                                getPredictedRiskMean)))
+
+
+soc_heat <- as.matrix(soc_plot_risk[,-1])
+rownames(soc_heat) <- soc_plot_risk$Drug
+colnames(soc_heat) <- rep(c("low", "high", "extreme"), 5)
+soc_heat_risk_12 <- soc_heat
+soc_labs_risk_12 <- factor(rep(sublabs, each=3), ordered=TRUE, levels=sublabs)
+
+soc_ia12_risk <- Heatmap(soc_heat_risk_12,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = soc_labs_risk_12,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+##draw(soc_ia12_risk) 
+
+```
+  
+## IA12 extract rr drug activity. 
+  
+```{r rr_ia12}
+############################## RR ##################################
+
+## rr drugs from drug_pheno
+rr_drugnames <- sort(unique(rr_drugs$Drug)) 
+
+##  dc regulon activity - drug_pheno
+ia12_dca_reg %>%
+   dplyr::filter(Drug %in% rr_drugnames) ->
+   rr_dcr
+
+# dc regulon activity - wall
+dcra %>%
+   dplyr::filter(Drug %in% wall_rr) ->
+   gene_rr
+
+## combine both 
+##rr_dcr <- rbind(rr_dcr, gene_rr) 
+rr_drug_labels <- rr_dcr$Drug
+
+## order by risk - low -> high
+rr_dcr <- data.frame(Drug=rr_dcr$Drug, rr_dcr[,mm_risk$sample]) 
+
+## store for later heatmap
+all_dcr <- rbind(all_dcr, rr_dcr)
+
+
+## order by chromosomal abnormalities
+probb <- seq(0.05, 0.95, 0.1)
+rr_labs_12 <- factor(rep(sublabs, each=10), ordered=TRUE, levels=sublabs)
+rr_plot <- data.frame(Drug=rr_dcr$Drug, 
+                       t(apply(rr_dcr[,mm_risk$sample[mm_risk$none==1]], 1, getPieceWiseMean)),
+                        t(apply(rr_dcr[,mm_risk$sample[mm_risk$del13==1]], 1, getPieceWiseMean)),
+                        t(apply(rr_dcr[,mm_risk$sample[mm_risk$del1p==1]], 1, getPieceWiseMean)),
+                        t(apply(rr_dcr[,mm_risk$sample[mm_risk$amp1q==1]], 1, getPieceWiseMean)),
+                        t(apply(rr_dcr[,mm_risk$sample[mm_risk$WHSC1==1]], 1, getPieceWiseMean)))
+
+rr_heat_12 <- as.matrix(rr_plot[,-1])
+rownames(rr_heat_12) <- rr_plot$Drug
+
+rr_ia12 <- Heatmap(rr_heat_12,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = soc_labs_12,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 5))
+##draw(rr_ia12) 
+
+
+### generate DCNA by risk class
+rr_plot_risk <- data.frame(Drug=rr_dcr$Drug, 
+                       t(apply(rr_dcr[,mm_risk$sample[mm_risk$none==1]], 1, 
+                               getPredictedRiskMean)),
+                        t(apply(rr_dcr[,mm_risk$sample[mm_risk$del13==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(rr_dcr[,mm_risk$sample[mm_risk$del1p==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(rr_dcr[,mm_risk$sample[mm_risk$amp1q==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(rr_dcr[,mm_risk$sample[mm_risk$WHSC1==1]], 1, 
+                                getPredictedRiskMean)))
+
+rr_heat <- as.matrix(rr_plot_risk[,-1])
+rownames(rr_heat) <- rr_plot_risk$Drug
+colnames(rr_heat) <- rep(c("low", "high", "extreme"), 5)
+rr_heat_risk_12 <- rr_heat
+rr_labs_risk_12 <- factor(rep(sublabs, each=3), ordered=TRUE, levels=sublabs)
+
+rr_ia12_risk <- Heatmap(rr_heat_risk_12,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = soc_labs_risk_12,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+##draw(rr_ia12_risk) 
+
+```
+
+
+## IA12 extract rest of rr
+  
+```{r rr_ia12_rest}
+############################## RR ##################################
+
+## rr drugs from drug_pheno
+rr_drugnames <- sort(unique(rr_plus$Drug)) 
+
+##  dc regulon activity - drug_pheno
+ia12_dca_reg %>%
+   dplyr::filter(Drug %in% rr_drugnames) ->
+   gbm_dcr
+
+gbm_drug_labels <- gbm_dcr$Drug
+
+## order by risk - low -> high
+gbm_dcr <- data.frame(Drug=gbm_dcr$Drug, gbm_dcr[,mm_risk$sample]) 
+
+## store for later heatmap
+all_dcr <- rbind(all_dcr, gbm_dcr)
+
+## order by chromosomal abnormalities
+probb <- seq(0.05, 0.95, 0.1)
+gbm_labs_12 <- factor(rep(sublabs, each=10), ordered=TRUE, levels=sublabs)
+gbm_plot <- data.frame(Drug=gbm_dcr$Drug, 
+                       t(apply(gbm_dcr[,mm_risk$sample[mm_risk$none==1]], 1, getPieceWiseMean)),
+                        t(apply(gbm_dcr[,mm_risk$sample[mm_risk$del13==1]], 1, getPieceWiseMean)),
+                        t(apply(gbm_dcr[,mm_risk$sample[mm_risk$del1p==1]], 1, getPieceWiseMean)),
+                        t(apply(gbm_dcr[,mm_risk$sample[mm_risk$amp1q==1]], 1, getPieceWiseMean)),
+                        t(apply(gbm_dcr[,mm_risk$sample[mm_risk$WHSC1==1]], 1, getPieceWiseMean)))
+
+gbm_heat_12 <- as.matrix(gbm_plot[,-1])
+rownames(gbm_heat_12) <- gbm_plot$Drug
+
+gbm_ia12 <- Heatmap(gbm_heat_12,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = soc_labs_12,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 5))
+##draw(gbm_ia12) 
+
+
+### generate DCNA by risk class
+gbm_plot_risk <- data.frame(Drug=gbm_dcr$Drug, 
+                       t(apply(gbm_dcr[,mm_risk$sample[mm_risk$none==1]], 1, 
+                               getPredictedRiskMean)),
+                        t(apply(gbm_dcr[,mm_risk$sample[mm_risk$del13==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(gbm_dcr[,mm_risk$sample[mm_risk$del1p==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(gbm_dcr[,mm_risk$sample[mm_risk$amp1q==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(gbm_dcr[,mm_risk$sample[mm_risk$WHSC1==1]], 1, 
+                                getPredictedRiskMean)))
+
+gbm_heat <- as.matrix(gbm_plot_risk[,-1])
+rownames(gbm_heat) <- gbm_plot_risk$Drug
+colnames(gbm_heat) <- rep(c("low", "high", "extreme"), 5)
+gbm_heat_risk_12 <- gbm_heat
+gbm_labs_risk_12 <- factor(rep(sublabs, each=3), ordered=TRUE, levels=sublabs)
+
+gbm_ia12_risk <- Heatmap(gbm_heat_risk_12,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = soc_labs_risk_12,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+##draw(gbm_ia12_risk) 
+
+```
+
+# IA18. 
+
+```{r ia18_load}
+
+read_csv( here("data/IA18_relapse_minernorm_best_quality_risk.csv")) %>%
+  dplyr::arrange(GuanScore) ->
+  ia18_pheno
+ia18_gene_exp <- read_csv(here("data/IA18_geneexp_for_program.csv"))
+
+## network activity
+ia18_prog <- read_csv(here("data/program_activity_py_zsamp_all.csv"))
+colnames(ia18_prog)[-1] <- str_replace(colnames(ia18_prog)[-1], pattern="_BM_CD138pos",
+                                       replacement="")
+ia18_prog <- data.frame(program=ia18_prog$program, ia18_prog[, ia18_pheno$sample])
+
+ia18_reg <- read_csv(here("data/regulon_activity_py_zsamp_all.csv"))
+colnames(ia18_reg)[-1] <- str_replace(colnames(ia18_reg)[-1], pattern="_BM_CD138pos",
+                                       replacement="")
+ia18_reg <- data.frame(regulon=ia18_reg$regulon, ia18_reg[, ia18_pheno$sample])
+```
+
+
+```{r ia18_druggie}
+
+ia18_dca_reg <- read_csv(here("data/ia18_drug_therapy_regulon.csv"))
+ia18_dca_prog <- read_csv(here("data/ia18_drug_therapy_program.csv"))
+
+dcra <- dcpa <- NULL
+for(t in c(dif_soc, wall_rr_targs)) {
+
+   ## extract program/regulon for this drug target
+   mm_sym %>%
+      dplyr::filter(SYMBOL == t) %>%
+      dplyr::select(program, regulon, SYMBOL) ->
+      sym_t
+   
+   ## calculate drug constrained regulon activity 
+   ia18_reg %>%
+      dplyr::filter(regulon %in% sym_t$regulon) ->
+   t_reg 
+
+   d1 <-  t(data.frame(apply(t_reg[,-1], 2, mean,na.rm=TRUE)))
+   dc <- data.frame(Drug=t, d1)
+   rownames(dc) <- NULL
+   dcra <- rbind(dcra, dc)
+   
+   ## calculate drug constrained program activity 
+   ia18_prog %>%
+      dplyr::filter(program %in% sym_t$program) ->
+   t_prog 
+
+   d1 <-  t(data.frame(apply(t_prog[,-1], 2, mean,na.rm=TRUE)))
+   dc <- data.frame(Drug=t, d1)
+   rownames(dc) <- NULL
+   dcpa <- rbind(dcpa, dc)
+   
+}
+```
+
+
+## IA18:extract soc drug activity
+
+```{r soc_ia18}
+
+############################ SOC ##################################
+## soc drugs from drug_pheno
+soc_drugnames <- sort(unique(soc_drugs$Drug)) 
+
+##  dc regulon activity - drug_pheno
+ia18_dca_reg %>%
+   dplyr::filter(Drug %in% soc_drugnames) -> 
+   soc_dcr
+
+## dc regulon activity - wall
+dcra %>%
+   dplyr::filter(Drug %in% dif_soc) ->
+   gene_soc
+
+## combine both and ensure that drugs are in same order 
+soc_dcr <- rbind(soc_dcr, gene_soc) 
+data.frame(Drug=soc_drug_labs) %>%
+  dplyr::left_join(soc_dcr) ->
+  soc_dcr
+
+## store for later heatmap
+all_dcr18 <- soc_dcr
+
+## order by risk - low -> high
+soc_dcr <- data.frame(Drug=soc_dcr$Drug, soc_dcr[,ia18_pheno$sample])
+
+## order by chromosomal abnormalities
+probb <- seq(0.05, 0.95, 0.1)
+soc_plot <-  data.frame(Drug=soc_dcr$Drug, t(apply(soc_dcr[,-1], 1, getPieceWiseMean, )))
+
+soc_heat_18 <- as.matrix(soc_plot[,-1])
+rownames(soc_heat_18) <- soc_plot$Drug
+
+soc_ia18 <- Heatmap(soc_heat_18,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  #column_split = soc_labs,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 5))
+##draw(soc_ia18) 
+
+
+### generate DCNA by risk class
+ia18_pheno %<>% dplyr::rename(syg_class=miner_class) 
+soc_plot_risk <- data.frame(Drug=soc_dcr$Drug, 
+                       t(apply(soc_dcr[,-1], 1, getPredictedRiskMean, phen=ia18_pheno)))
+
+soc_heat_risk_18 <- as.matrix(soc_plot_risk[,-1])
+rownames(soc_heat_risk_18) <- soc_plot_risk$Drug
+colnames(soc_heat_risk_18) <- c("low", "high", "extreme")
+soc_labs_risk_18 <- factor(rep(sublabs, each=3), ordered=TRUE, levels=sublabs)
+
+soc_ia18_risk <- Heatmap(soc_heat_risk_18,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  ##column_split = soc_labs_risk,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+##draw(soc_ia18_risk) 
+
+```
+  
+  
+## IA18: extract rr drug activity  
+
+```{r rr_ia82}
+############################## RR ##################################
+
+## rr drugs from drug_pheno
+rr_drugnames <- sort(unique(rr_drugs$Drug)) 
+
+##  dc regulon activity - drug_pheno
+ia18_dca_reg %>%
+   dplyr::filter(Drug %in% rr_drugnames) ->
+   rr_dcr_18
+
+# dc regulon activity - wall
+dcra %>%
+   dplyr::filter(Drug %in% wall_rr) ->
+   gene_rr
+
+## combine both 
+rr_dcr <- rbind(rr_dcr_18, gene_rr) 
+data.frame(Drug=rr_drug_labels) %>%
+  dplyr::left_join(rr_dcr) ->
+  rr_dcr
+
+## order by risk - low -> high
+rr_dcr <- data.frame(Drug=rr_dcr$Drug, rr_dcr[,ia18_pheno$sample]) 
+
+## store for later heatmap
+all_dcr18 <- rbind(all_dcr18, rr_dcr)
+
+## order by risk prediction
+probb <- seq(0.05, 0.95, 0.1)
+rr_plot <- data.frame(Drug=rr_dcr$Drug, t(apply(rr_dcr[,-1], 1, getPieceWiseMean)))
+
+rr_heat_18 <- as.matrix(rr_plot[,-1])
+rownames(rr_heat_18) <- rr_plot$Drug
+
+rr_ia18 <- Heatmap(rr_heat_18,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  ##column_split = soc_labs_12,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 5))
+##draw(rr_ia18) 
+
+
+### generate DCNA by risk class
+rr_plot_risk <- data.frame(Drug=rr_dcr$Drug, t(apply(rr_dcr[,-1], 1, 
+                          getPredictedRiskMean, phen=ia18_pheno)))
+
+rr_heat <- as.matrix(rr_plot_risk[,-1])
+rownames(rr_heat) <- rr_plot_risk$Drug
+colnames(rr_heat) <- c("low", "high", "extreme")
+rr_heat_risk_18 <- rr_heat
+rr_labs_risk_18 <- factor(rep(sublabs, each=3), ordered=TRUE, levels=sublabs)
+
+rr_ia18_risk <- Heatmap(rr_heat_risk_18,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+##draw(rr_ia18_risk) 
+
+```
+
+## IA18 extract rest of rr
+  
+```{r rr_ia18_rest}
+############################## RR ##################################
+
+## rr drugs from drug_pheno
+rr_drugnames <- sort(unique(rr_plus$Drug)) 
+
+##  dc regulon activity - drug_pheno
+ia18_dca_reg %>%
+   dplyr::filter(Drug %in% rr_drugnames) ->
+   gbm_dcr
+
+data.frame(Drug=gbm_drug_labels) %>%
+  dplyr::left_join(gbm_dcr) ->
+  gbm_dcr
+
+## order by risk - low -> high
+gbm_dcr <- data.frame(Drug=gbm_dcr$Drug, gbm_dcr[,ia18_pheno$sample]) 
+
+# store for later heatmap
+all_dcr18 <- rbind(all_dcr18, gbm_dcr)
+
+## order by chromosomal abnormalities
+probb <- seq(0.05, 0.95, 0.1)
+gbm_plot <- data.frame(Drug=gbm_dcr$Drug, t(apply(gbm_dcr[,-1], 1, 
+                                                  getPieceWiseMean)))
+
+gbm_heat_18 <- as.matrix(gbm_plot[,-1])
+rownames(gbm_heat_18) <- gbm_plot$Drug
+
+gbm_ia18 <- Heatmap(gbm_heat_18,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 5))
+##draw(gbm_ia18) 
+
+
+### generate DCNA by risk class
+gbm_plot_risk <-data.frame(Drug=gbm_dcr$Drug, t(apply(gbm_dcr[,-1], 1, 
+                          getPredictedRiskMean, phen=ia18_pheno)))
+gbm_labs_risk_18 <- factor(rep(sublabs, each=3), ordered=TRUE, levels=sublabs)
+
+gbm_heat <- as.matrix(gbm_plot_risk[,-1])
+rownames(gbm_heat) <- gbm_plot_risk$Drug
+colnames(gbm_heat) <- c("low", "high", "extreme")
+gbm_heat_risk_18 <- gbm_heat
+
+gbm_ia18_risk <- Heatmap(gbm_heat_risk_18,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+##draw(gbm_ia18_risk) 
+
+```
+
+
+## Full soc plot
+  
+```{r ia_both_soc} 
+## DCNA 
+ia_split <- factor(c(as.character(soc_labs_12), rep("relapse", ncol(soc_heat_18))),
+                   levels=c("none", "del(13)", "del(1p)", "amp(1q)", "t(4;14)", "relapse"),
+                   ordered=TRUE)
+soc_ia_both <- cbind(soc_heat_12, soc_heat_18)
+
+soc_ia_both_heat <- Heatmap(soc_ia_both,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_split,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 5))
+##draw(soc_ia_both_heat) 
+
+## plot by risk class
+ia_split_risk <- factor(c(as.character(soc_labs_risk_12), rep("relapse", 3)),
+                   levels=c("none", "del(13)", "del(1p)", "amp(1q)", "t(4;14)", "relapse"),
+                   ordered=TRUE)
+soc_ia_both_risk <- cbind(soc_heat_risk_12, soc_heat_risk_18)
+
+ia_both_risk <- Heatmap(soc_ia_both_risk,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_split_risk,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+##draw(ia_both_risk) 
+
+```
+
+## full rr plot
+
+```{r ia_both_rr} 
+## DCNA 
+ia_split <- factor(c(as.character(rr_labs_12), rep("relapse", ncol(rr_heat_18))),
+                   levels=c("none", "del(13)", "del(1p)", "amp(1q)", "t(4;14)", "relapse"),
+                   ordered=TRUE)
+rr_ia_both <- cbind(rr_heat_12, rr_heat_18)
+
+rr_ia_both_heat <- Heatmap(rr_ia_both,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_split,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 5))
+##draw(rr_ia_both_heat) 
+
+## plot by risk class
+ia_split_risk <- factor(c(as.character(soc_labs_risk_12), rep("relapse", 3)),
+                   levels=c("none", "del(13)", "del(1p)", "amp(1q)", "t(4;14)", "relapse"),
+                   ordered=TRUE)
+rr_ia_both_risk <- cbind(rr_heat_risk_12, rr_heat_risk_18)
+
+ia_both_risk <- Heatmap(rr_ia_both_risk,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_split_risk,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+##draw(ia_both_risk) 
+
+```
+
+
+## full gbm drugs plot
+
+```{r ia_both_gbm} 
+## DCNA 
+ia_split <- factor(c(as.character(rr_labs_12), rep("relapse", ncol(gbm_heat_18))),
+                   levels=c("none", "del(13)", "del(1p)", "amp(1q)", "t(4;14)", "relapse"),
+                   ordered=TRUE)
+gbm_ia_both <- cbind(gbm_heat_12, gbm_heat_18)
+
+gbm_ia_both_plot <- Heatmap(gbm_ia_both,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_split,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 5))
+##draw(gbm_ia_both_plot) 
+
+## plot by risk class
+ia_split_risk <- factor(c(as.character(gbm_labs_risk_18), rep("relapse", 3)),
+                   levels=c("none", "del(13)", "del(1p)", "amp(1q)", "t(4;14)", "relapse"),
+                   ordered=TRUE)
+gbm_ia_both_risk <- cbind(gbm_heat_risk_12, gbm_heat_risk_18)
+
+gbm_both_risk <- Heatmap(gbm_ia_both_risk,
+                  col=col_fun,
+                  #bottom_annotation = ba,
+                  ##top_annotation = col_annot,
+                  ##left_annotation = row_annot_left,
+                  ##right_annotation = ha,
+                  ##row_order=ordy,
+                  ##column_order=c_ordy,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_split_risk,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+##draw(gbm_both_risk) 
+
+```
+
+
+## manuscript plots. 
+
+```{r man}
+
+
+## Plot all drugs with continous network activity
+ia_col_split <- factor(c(as.character(rr_labs_12), rep("relapse", ncol(gbm_heat_18))),
+                     levels=c("none", "del(13)", "del(1p)", "amp(1q)", "t(4;14)", "relapse"),
+                     ordered=TRUE)
+ia_row_split <- factor(c(rep("SOC", nrow(soc_ia_both)), rep("RR", nrow(rr_ia_both_risk)),
+                  rep("MM related drugs", nrow(gbm_ia_both))), 
+                  levels=c("SOC", "RR", "MM related drugs"),
+                  ordered=TRUE)
+
+## combine all drug plots
+ia_all <- rbind(soc_ia_both, rr_ia_both, gbm_ia_both)
+
+## join drug infor
+data.frame(Drug=rownames(ia_all)) %>%
+   dplyr::left_join(drug_cat) ->
+   dinfo
+
+DT::datatable(dinfo)
+
+as.data.frame(table(dinfo$type)) %>%
+   arrange(desc(Freq)) %>%
+   rename(Type=Var1) ->
+   dtab
+headerKable(dtab, title="Drug classes")
+
+## rearrange drugs 
+ dinfo %>%
+    plyr::mutate(index=plyr::mapvalues(treatment, from=c("SOC", "RR", "MM"),
+                                       to=c(1:3))) %>%
+    dplyr::arrange(index, type)->
+    dsort
+
+## create colors for drug types
+set.seed(123)
+types <- unique(dinfo$type)
+n <- length(types)
+col_types <- distinctColorPalette(n)
+names(col_types) <- unique(dinfo$type)
+##pie(rep(1, n), col=unlist(col_types))
+
+
+## create row annotations. 
+ha = HeatmapAnnotation(
+  class=dsort$type,
+  col= list(class=col_types),
+  which="row",
+  border=FALSE,
+  gap=unit(1, "points"))
+
+
+bot <- HeatmapAnnotation('disease\nprogression' = anno_block(labels = rep(c("slow -> fast"), 6), 
+                                           gp=gpar(col="white"),
+        labels_gp = gpar(col = "black", fontsize = 7.5), show_name=TRUE))
+##bot <- HeatmapAnnotation(risk=anno_text(rep(c("low -> high"), 6), which=column, show_name=TRUE))
+
+## sort drug order by treatment and type
+ia_all <- ia_all[unlist(dsort$Drug),]
+
+## store drugs and categories for scca plots
+mmdrugs <- data.frame(Drug=rownames(ia_all), category=ia_row_split)
+
+ia_all_plot <- Heatmap(ia_all,
+                  col=col_fun,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_col_split,
+                  column_title_gp = gpar(fontsize=11),
+                  row_split=ia_row_split,
+                  border=TRUE,
+                  bottom_annotation=bot,
+                  left_annotation = ha,
+                  ##column_title="Risk: low -> high",
+                  ##column_title_side="bottom",
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 6.5),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  ##rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 2))
+draw(ia_all_plot) 
+
+pdf(file=here("output/heat_syg_outcome_dcra.pdf"))
+draw(ia_all_plot) 
+dev.off()
+
+# combine all drug plots
+ia_all_risk <- rbind(soc_ia_both_risk, rr_ia_both_risk, gbm_ia_both_risk)
+ 
+## sort drug order by treatment and type
+ia_all_risk <- ia_all_risk[unlist(dsort$Drug),]
+
+ia_all_risk_plot <-Heatmap(ia_all_risk,
+                  col=col_fun,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  left_annotation = ha,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_split_risk,
+                  column_title_gp = gpar(fontsize=11),
+                  row_split=ia_row_split,
+                    row_title="",
+                  border=TRUE,
+                  column_gap=unit(0.5, "mm"),
+                  row_names_gp = gpar(fontsize = 6.5),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "grey", lwd = 0.005),
+                )
+
+draw(ia_all_risk_plot) 
+
+pdf(file=here("output/heat_syg_risk_dcra.pdf"))
+draw(ia_all_risk_plot) 
+dev.off()
+
+```
+
+## Individual plots
+
+
+```{r indy}
+
+## subtype levels
+labels <- c("none", "del(13)", "del(1p)", "amp(1q)", "t(4;14)", "relapse")
+
+## generate column splits by mmSYGNAL risk classification 
+subs <- c("none", "del13", "del1p", "amp1q", "WHSC1")
+
+freqs <- data.frame(class=c("low", "high", "extreme"))
+splits <- col_splits <- NULL
+count <- 0
+for(s in subs) {
+   riskk <- mm_risk[mm_risk[, s]==1,] 
+   tab <- as.data.frame(table(riskk$syg_class))
+   f1 <- freqs %>% dplyr::left_join(tab, by=c("class"="Var1"))
+   
+   ## assemble labels
+   splits <- c(splits, c(rep(f1[1,1], f1[1,2]),
+                         rep(f1[2,1], f1[2,2]),
+                         rep(f1[3,1], f1[3,2])))
+   ## assemble split values 
+   col_splits <- c(col_splits, c(rep(count+1, f1[1,2]),
+                                 rep(count+2, f1[2,2]),
+                                 rep(count+3, f1[3,2])))
+   count <- count+3
+}
+
+## calculate splits for ia18
+tab <- as.data.frame(table(ia18_pheno$syg_class))
+f1 <- left_join(freqs, tab, by=c("class"="Var1"))
+splits <- c(splits, c(rep(f1[1,1], f1[1,2]),
+                      rep(f1[2,1], f1[2,2]),
+                      rep(f1[3,1], f1[3,2])))
+col_splits <- c(col_splits, c(rep(count+1, f1[1,2]),
+                              rep(count+2, f1[2,2]),
+                              rep(count+3, f1[3,2])))
+splits <- rep(c("low", "high", "extreme"), 6)
+
+## reorder ia12 by subtype
+ia_order12 <- getRiskOrder(all_dcr)
+
+## reorder ia18 by subtype
+ia18_pheno %>%
+   dplyr::mutate(syg_class=factor(syg_class, levels=c("low", "high", "extreme"),
+                                   ordered=TRUE)) %>%
+   dplyr::arrange(syg_class) ->
+   ia18_sort
+
+ia_order18 <- all_dcr18[,ia18_sort$sample] 
+
+## combine ND and relapse patients 
+ia_order <- cbind(ia_order12, ia_order18)
+ia_order <- as.matrix(ia_order[,-1])
+rownames(ia_order) <- ia_order12$Drug
+
+## sort drug order by treatment and type
+ia_order <- ia_order[unlist(dsort$Drug),]
+
+ia_order_plot <-Heatmap(ia_order,
+                  col=col_fun,
+                  show_column_names = FALSE,
+                  column_title_rot = 45,
+                  column_names_centered = TRUE,
+                  left_annotation = ha,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = col_splits,
+                  column_title=splits,
+                  column_title_gp = gpar(fontsize=12),
+                  row_split=ia_row_split,
+                    row_title="",
+                  border=TRUE,
+                  column_gap=unit(0.7, "mm"),
+                  row_names_gp = gpar(fontsize = 12),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F
+                  ##rect_gp = gpar(col = "grey", lwd = 0.00000005),
+                )
+
+draw(ia_order_plot) 
+
+pdf(file=here("output/heat_syg_individual_dcra.pdf"),
+    width=12, height=8)
+draw(ia_order_plot) 
+dev.off()
+
+```
+
+
+
+```{r sorty}
+
+## sort by drug type 
+dinfo %>%
+   dplyr::arrange(type) ->
+   dsort
+
+ia_all_sort <- ia_all[dsort$Drug,]
+
+# create row annotations. 
+ha = HeatmapAnnotation(
+  class=dsort$type,
+  col= list(class=col_types),
+  which="row",
+  border=FALSE,
+  gap=unit(1, "points")) 
+
+
+
+ia_all_sort <- Heatmap(ia_all_sort,
+                  col=col_fun,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_col_split,
+                  column_title_gp = gpar(fontsize=11),
+                  ##row_split=ia_row_split,
+                  border=TRUE,
+                  bottom_annotation=bot,
+                  left_annotation = ha,
+                  ##column_title="Risk: low -> high",
+                  ##column_title_side="bottom",
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 6.5),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 2))
+draw(ia_all_sort) 
+
+ia_all_risk_sort <- ia_all_risk[dsort$Drug,]
+
+ia_all_risk_sort <-Heatmap(ia_all_risk_sort,
+                  col=col_fun,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  left_annotation = ha,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_split_risk,
+                  column_title_gp = gpar(fontsize=11),
+                  ##row_split=ia_row_split,
+                  ##  row_title="",
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 6.5),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+draw(ia_all_risk_sort) 
+
+```
+
+```{r boxplots}
+
+## organize dcna by predicted risk 
+rbind(rr_drugs) %>% 
+   dplyr::select(Drug) %>% 
+   distinct() -> 
+   rr_all_drugs 
+
+ia12_dca_reg %>%
+   dplyr::filter(Drug %in% rr_all_drugs$Drug) %>% 
+   pivot_longer(cols=colnames(ia12_dca_reg)[-1], names_to="pid", 
+                values_to="dcna") %>% 
+   dplyr::left_join(mm_risk[, c("sample", "GuanScore", "risk", "syg_class", "syg_risk", "none", 
+               "del1p", "amp1q", "CCND1", "FGFR3", "WHSC1")], by=c("pid"="sample") ) %>%
+   dplyr::rename(t414=WHSC1, t1114=CCND1) ->
+ ia12_dca
+   
+text_sizey <- 12
+leg_size=12
+
+# calculate Wilcoxon rank sum test between responder/nonresponder
+## coll - defines feature to apply test to
+myWilcoxon <- function(mat, coll="dcna") {
+     score <- unlist(mat[,coll])
+     resp <- score[mat$syg_class=="extreme"]
+     noresp <- score[mat$syg_class=="low"]
+     wt <- wilcox.test(resp, noresp, alternative="less")
+     return(signif(wt$p.value, 2))
+}
+
+mywil <- myWilcoxon(ia12_dca)
+
+ggplot(ia12_dca, aes(x=risk, y=dcna)) + 
+  geom_violin(aes(color=risk, fill=risk), alpha=0.5) +
+  scale_color_manual(values=c("#d73027", "green", "#4575b4")) +
+  scale_fill_manual(values=c("#d73027", "green", "#4575b4")) +
+  geom_jitter(width=0.1, height=0.01, aes(color=risk)) + 
+  #geom_hline(yintercept=hts_cut1, linetype="dotted") +
+  xlab("clinical outcome: Guan score") + ylab("DCNA") +
+  ##ggtitle(paste("Regulon: EC50", "Wilcox test: ", wpval)) +
+  theme(axis.text = element_text(size=text_sizey)) +
+  guides(color="none", fill="none") +
+  theme(aspect.ratio=1/1) +
+  theme(plot.title=element_text(size=leg_size)) +
+  geom_text(inherit.aes = F, data=ia12_dca |> group_by(risk) |> summarise(count=n()), 
+            aes(x=risk, y=1.2, label=count)) 
+
+
+ggplot(ia12_dca, aes(x=syg_class, y=dcna)) + 
+  geom_boxplot(aes(color=syg_class, fill=
+                     ), alpha=0.5) +
+  scale_color_manual(values=c("#d73027", "green", "#4575b4")) +
+  scale_fill_manual(values=c("#d73027", "green", "#4575b4")) +
+  geom_jitter(width=0.1, height=0.01, aes(color=syg_class)) + 
+  #geom_hline(yintercept=hts_cut1, linetype="dotted") +
+  xlab("mmSYGNAL risk prediction") + ylab("DCNA") +
+  ##ggtitle(paste("Regulon: EC50", "Wilcox test: ", wpval)) +
+  theme(axis.text = element_text(size=text_sizey)) +
+  guides(color="none", fill="none") +
+  theme(aspect.ratio=1/1) +
+  theme(plot.title=element_text(size=leg_size)) +
+  geom_text(inherit.aes = F, data=ia12_dca |> group_by(syg_class) |> summarise(count=n()), 
+            aes(x=syg_class, y=1.2, label=count)) 
+
+ggplot(ia12_dca[ia12_dca$none==1,], aes(x=syg_class, y=dcna)) + 
+  geom_boxplot(aes(color=syg_class, fill=syg_class), alpha=0.5) +
+  scale_color_manual(values=c("#d73027", "green", "#4575b4")) +
+  scale_fill_manual(values=c("#d73027", "green", "#4575b4")) +
+  geom_jitter(width=0.1, height=0.01, aes(color=syg_class)) + 
+  #geom_hline(yintercept=hts_cut1, linetype="dotted") +
+  xlab("mmSYGNAL risk prediction") + ylab("DCNA") +
+  ##ggtitle(paste("Regulon: EC50", "Wilcox test: ", wpval)) +
+  theme(axis.text = element_text(size=text_sizey)) +
+  guides(color="none", fill="none") +
+  theme(aspect.ratio=1/1) +
+  theme(plot.title=element_text(size=leg_size)) +
+  geom_text(inherit.aes = F, data=ia12_dca |> group_by(syg_class) |> summarise(count=n()), 
+            aes(x=syg_class, y=1.2, label=count)) 
+
+
+```
+
+
+
+
+
+
+# PARP pathway
+
+```{r parp_load}
+
+
+
+## genes involoved in PARP dna-repair pathwya
+parp_all_genes <- c("PARP1", "PARP2", "MYC", "POLD2", "CDK12")
+
+## HR relevant genes mapped to mmSYGNAL
+parp_hr_genes <- c("RAD51", "RAD52", "MRE11", "ATM", "BARD1")
+
+parp_all_genes <- c(parp_all_genes, parp_hr_genes)
+
+## find those genes present in mmSYGNAL
+gen_sym %>%
+   dplyr::filter(SYMBOL %in% parp_all_genes) %>%
+   dplyr::select(SYMBOL) %>%
+   unlist() %>%
+   unique() %>%
+   sort() ->
+   parp_genes
+
+  
+```
+
+```{r parp_1a12}
+
+## Generaate PARP associated genes DCNA
+dcra_parp <- dcpa_parp <- NULL
+for(t in parp_genes) {
+
+   ## extract program/regulon for this drug target
+   mm_sym %>%
+      dplyr::filter(SYMBOL == t) %>%
+      dplyr::select(program, regulon, SYMBOL) ->
+      sym_t
+   
+   ## calculate drug constrained regulon activity 
+   ia12_reg %>%
+      dplyr::filter(Regulon %in% sym_t$regulon) ->
+   t_reg 
+
+   d1 <-  t(data.frame(apply(t_reg[,-1], 2, mean,na.rm=TRUE)))
+   dc <- data.frame(Drug=t, d1)
+   rownames(dc) <- NULL
+   dcra_parp <- rbind(dcra_parp, dc)
+   
+   ## calculate drug constrained program activity 
+   ia12_prog %>%
+      dplyr::filter(Program %in% sym_t$program) ->
+   t_prog 
+
+   d1 <-  t(data.frame(apply(t_prog[,-1], 2, mean,na.rm=TRUE)))
+   dc <- data.frame(Drug=t, d1)
+   rownames(dc) <- NULL
+   dcpa_parp <- rbind(dcpa_parp, dc)
+   
+}
+
+## generate deciles
+parp12_plot <- data.frame(Drug=dcra_parp$Drug, 
+                       t(apply(dcra_parp[,mm_risk$sample[mm_risk$none==1]], 1, getPieceWiseMean)),
+                        t(apply(dcra_parp[,mm_risk$sample[mm_risk$del13==1]], 1, getPieceWiseMean)),
+                        t(apply(dcra_parp[,mm_risk$sample[mm_risk$del1p==1]], 1, getPieceWiseMean)),
+                        t(apply(dcra_parp[,mm_risk$sample[mm_risk$amp1q==1]], 1, getPieceWiseMean)),
+                        t(apply(dcra_parp[,mm_risk$sample[mm_risk$WHSC1==1]], 1, getPieceWiseMean)))
+
+### generate DCNA by risk class
+parp12_plot_risk <- data.frame(Drug=dcra_parp$Drug, 
+                       t(apply(dcra_parp[,mm_risk$sample[mm_risk$none==1]], 1, 
+                               getPredictedRiskMean)),
+                        t(apply(dcra_parp[,mm_risk$sample[mm_risk$del13==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(dcra_parp[,mm_risk$sample[mm_risk$del1p==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(dcra_parp[,mm_risk$sample[mm_risk$amp1q==1]], 1, 
+                                getPredictedRiskMean)),
+                        t(apply(dcra_parp[,mm_risk$sample[mm_risk$WHSC1==1]], 1, 
+                                getPredictedRiskMean)))
+```
+
+```{r parp_ia18}
+
+dcra18_parp <- dcpa18_parp <- NULL
+for(t in parp_genes) {
+
+   ## extract program/regulon for this drug target
+   mm_sym %>%
+      dplyr::filter(SYMBOL == t) %>%
+      dplyr::select(program, regulon, SYMBOL) ->
+      sym_t
+   
+   ## calculate drug constrained regulon activity 
+   ia18_reg %>%
+      dplyr::filter(regulon %in% sym_t$regulon) ->
+   t_reg 
+
+   d1 <-  t(data.frame(apply(t_reg[,-1], 2, mean,na.rm=TRUE)))
+   dc <- data.frame(Drug=t, d1)
+   rownames(dc) <- NULL
+   dcra18_parp <- rbind(dcra18_parp, dc)
+   
+   ## calculate drug constrained program activity 
+   ia18_prog %>%
+      dplyr::filter(program %in% sym_t$program) ->
+   t_prog 
+
+   d1 <-  t(data.frame(apply(t_prog[,-1], 2, mean,na.rm=TRUE)))
+   dc <- data.frame(Drug=t, d1)
+   rownames(dc) <- NULL
+   dcpa18_parp <- rbind(dcpa18_parp, dc)
+   
+}
+
+## order by risk - low -> high
+parp18 <- data.frame(Drug=dcra18_parp$Drug, dcra18_parp[,ia18_pheno$sample]) 
+
+## generate deciles
+probb <- seq(0.05, 0.95, 0.1)
+parp18_plot <- data.frame(Drug=parp18$Drug, t(apply(parp18[,-1], 1, getPieceWiseMean)))
+
+## order by risk prediction
+parp18_plot_risk <- data.frame(Drug=parp18$Drug, t(apply(parp18[,-1], 1, getPredictedRiskMean,
+                                                          phen=ia18_pheno)))
+
+```
+
+
+```{r parp_plots}
+
+parp_split <- factor(c(rep("PARP inhibition", 5), c(rep("HR", 5))),
+                     levels=c("PARP inhibition", "HR"), ordered=TRUE)
+
+########## decile plots ##################
+parpy <- parp12_plot %>% dplyr::left_join(parp18_plot, by="Drug") 
+parp_mat <- as.matrix(parpy[,-1])
+rownames(parp_mat) <- parpy$Drug
+parp_mat <- parp_mat[parp_all_genes,]
+
+parpy_decile <- Heatmap(parp_mat[1:5,],
+                  col=col_fun,
+                  show_column_names = FALSE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_col_split,
+                  column_title_gp = gpar(fontsize=11),
+                  ##row_split=parp_split,
+                  border=TRUE,
+                  bottom_annotation=bot,
+                  ##left_annotation = ha,
+                  ##column_title="Risk: low -> high",
+                  ##column_title_side="bottom",
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 6.5),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                  column_names_gp = gpar(fontsize = 2))
+draw(parpy_decile) 
+
+
+########## risk plots ##################
+parpy_risk <- parp12_plot_risk %>% dplyr::left_join(parp18_plot_risk, by="Drug") 
+parp_mat_risk <- as.matrix(parpy_risk[,-1])
+rownames(parp_mat_risk) <- parpy_risk$Drug
+colnames(parp_mat_risk) <- rep(c("low", "high", "extreme"), 6)
+
+parp_mat_risk <- parp_mat_risk[parp_all_genes,]
+
+parpy_risk <- Heatmap(parp_mat_risk[1:5,],
+                  col=col_fun,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split = ia_split_risk,
+                  column_title_gp = gpar(fontsize=11),
+                  ##row_split=parp_split,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 6.5),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F,
+                  rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+draw(parpy_risk) 
+
+pdf(file=here("output/heat_syg_parp_dcra.pdf"),
+    height=3)
+draw(parpy_risk) 
+dev.off()
+
+```
+
+
+# SCCA 
+
+
+```{r scca_load}
+
+## calculate Wilcoxon rank sum test between responder/nonresponder
+## coll - defines feature to apply test to
+myWilcoxon <- function(mat, coll="EC50M") {
+     score <- unlist(mat[,coll])
+     resp <- score[mat$response=="responders"]
+     noresp <- score[mat$response=="nonresponders"]
+     wt <- wilcox.test(resp, noresp, alternative="less")
+     return(signif(wt$p.value, 2))
+}
+
+leg_size=12
+point_size=0.01
+text_sizey <- 12
+
+## updated SCCA pheno info 
+pheno <- read_csv(here("data/SCCA_updated_pheno.csv"))
+pheno %>%
+  dplyr::mutate(pid=str_replace(Patient_ID, "MM", "")) %>%
+  dplyr::mutate(pid=str_replace(pid, "9944-", "")) ->
+  pheno
+
+## pam beckert's drug assay drugs
+read_csv(here("data/merged_drug_sensitivity_data.csv")) %>%
+   dplyr::mutate(DrugName=toupper(DrugName)) %>%
+   dplyr::mutate(pid=str_remove(Sample, "9944-")) %>%
+   dplyr::rename(EC50M=`EC50 (M)`, AUC_unscaled='AUCmin-max') %>%
+   dplyr::select(pid, DrugName, EC50M, AUC_unscaled) -> 
+  pam_drugs 
+
+## get drug constrained network activity for programs and regulons
+dca_reg <- read_csv(here("data/scca_regulon_dca.csv"))
+
+## add EC50 to drug info
+dca_reg %<>% dplyr::left_join(pam_drugs)
+
+## add mmSYGNAL response predictions >=0 responder, else nonresponder
+dca_reg %>%
+  dplyr::mutate(response=ifelse(dca >0, "responders", "nonresponders")) %>%
+  dplyr::mutate(EC50M=ifelse(EC50M >= 1e-02, 1e-02, EC50M)) ->
+  dca_reg
+
+## regulon DCA
+wpval <- myWilcoxon(dca_reg, coll="EC50M")
+gg1 <- ggplot(dca_reg, aes(x=response, y=EC50M)) + 
+  geom_boxplot(aes(color=response, fill=response), alpha=0.5) +
+  scale_y_log10() + scale_color_manual(values=c("#4575b4", "#d73027")) +
+  scale_fill_manual(values=c("#4575b4", "#d73027")) +
+  geom_jitter(width=0.1, height=0.01, aes(color=response)) + 
+  #geom_hline(yintercept=hts_cut1, linetype="dotted") +
+  xlab("mmSYGNAL predicted response") + ylab("log10 EC50M") +
+  ggtitle(paste("Regulon: EC50", "Wilcox test: ", wpval)) +
+  theme(axis.text = element_text(size=text_sizey)) +
+  guides(color="none", fill="none") +
+  theme(aspect.ratio=1/1) +
+  theme(plot.title=element_text(size=leg_size)) +
+  geom_text(inherit.aes = F, data=dca_reg |> group_by(response) |> summarise(count=n()), aes(x=response, y=0.05, label=count)) 
+ggsave(filename=here("output/scca_drug_boxplot_dcna.pdf"))
+print(gg1)
+
+wpval <- myWilcoxon(dca_reg, coll="AUC_unscaled")
+gg2 <- ggplot(dca_reg, aes(x=response, y=AUC_unscaled)) + 
+  geom_boxplot(aes(color=response, fill=response), alpha=0.5) +
+  scale_color_manual(values=c("#4575b4", "#d73027")) +
+  scale_fill_manual(values=c("#4575b4", "#d73027")) +
+  geom_jitter(width=0.1, height=0, aes(color=response)) + 
+  #geom_hline(yintercept=hts_cut1, linetype="dotted") +
+  xlab("mmSYGNAL predicted response") + ylab("AUC") +
+  ggtitle(paste("Regulon: AUC", "Wilcox test: ", wpval)) +
+  theme(axis.text = element_text(size=text_sizey)) +
+  guides(color="none", fill="none") +
+  theme(aspect.ratio=1/1) +
+  theme(plot.title=element_text(size=leg_size)) +
+  geom_text(inherit.aes = F, data=dca_reg |> group_by(response) |> summarise(count=n()), aes(x=response, y=0.00125, label=count)) 
+ggsave(filename=here("output/scca_drug_boxplot_dcna_auc.pdf"))
+print(gg2)
+
+
+```
+
+
+```{r}
+
+##################################### SCCA ##################################
+
+## scca regulon and program activity  
+read_csv(here("data/regulon_activity_scca_py.csv") ) %>%
+  dplyr::select(contains("BCMA-positive") | regulon) %>%
+  dplyr::select(regulon, everything())->
+  scca_reg
+
+colnames(scca_reg) <- str_replace_all(colnames(scca_reg), 
+                                  pattern=c("9944-"="", 
+                                            "-BM-BCMA-positive"=""))
+                                  
+read_csv(here("data/program_activity_scca_py.csv") ) %>%
+  dplyr::select(contains("BCMA-positive") | program) %>%
+  dplyr::select(program, everything())->
+  scca_prog
+
+colnames(scca_prog) <- str_replace_all(colnames(scca_prog), 
+                                  pattern=c("9944-"="", 
+                                            "-BM-BCMA-positive"=""))
+
+# get SCCA drug constrained activity
+scca_dca_reg <- read_csv(here("data/scca_dca_regulon.csv"))
+scca_dca_reg_dt <- data.table::melt(as.data.table(scca_dca_reg), 
+                                    id.vars=c("Drug", "effect", "MM_Phase", "Cancer_PhaseIV"),
+                                    variable.name="pid", value.name="dca")
+
+scca_dca_prog <- read_csv(here("data/scca_dca_program.csv"))
+scca_dca_prog_dt <- data.table::melt(as.data.table(scca_dca_prog[,-c(3:4)]), 
+                                    id.vars=c("Drug", "effect"),
+                                    variable.name="pid", value.name="dca")
+
+## get SCCA HTS drug info (created in drug_rankings.Rmd)
+scca_all_dt <- read_csv(here("data/scca_drug_analysis_data_alldrugs.csv"))
+scca_all_dt <- data.table(scca_all_dt)
+scca_all_dt$pid <- str_sub(scca_all_dt$Sample, start=6, end=7)
+
+## get pids for samples we have scca drug screen info
+pids <- sort(unique(scca_all_dt$Sample))
+labs <- str_replace(pids, pattern="9944-", "") 
+pid_labs <- paste0("P", labs)
+
+## get drug screen patients pheno data
+pheno %>%
+  dplyr::arrange(Lines_of_prior_therapy) ->
+   scca_pheno
+
+## reformat identically to mm data heatmaps 
+scca_dca_reg %<>% dplyr::select(-effect, -MM_Phase, -Cancer_PhaseIV) 
+colnames(scca_dca_reg) <- str_replace(colnames(scca_dca_reg), pattern="MM",
+                                      replacement="") 
+  
+## extract mm drugs
+mmdrugs %>%
+  dplyr::left_join(scca_dca_reg) ->
+  scca_reg_mm
+
+## order by lines of treatment
+scca_reg_mm <- data.frame(Drug=scca_reg_mm$Drug, category=scca_reg_mm$category,        scca_reg_mm[,scca_pheno$pid])
+colnames(scca_reg_mm) <- str_replace(colnames(scca_reg_mm), pattern="X",
+                                     replacement="")
+
+```
+
+
+## SCCA heatmap for mm drugs
+
+```{r scca_beck}
+ 
+## extract previous lines of treatment in order of scca_reg_mm
+treats <- scca_pheno$Lines_of_prior_therapy
+treat_num <- factor(treats, levels=sort(unique(treats)), ordered=TRUE)
+
+bot <- HeatmapAnnotation('treatment\nlines' = anno_block(labels =sort(unique(treats)), 
+                                           gp=gpar(col="white"),
+        labels_gp = gpar(col = "black", fontsize = 12), show_name=FALSE))
+
+row_split <- scca_reg_mm$category
+scca_plot <- as.matrix(scca_reg_mm[,-c(1:2)])
+rownames(scca_plot) <- scca_reg_mm$Drug
+  
+scca_plot_67 <- Heatmap(scca_plot,
+                  col=col_fun,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  column_split=treat_num,
+                  column_title="Number of treatment lines",
+                  column_title_side = c("bottom"),
+                  row_split=row_split,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 8),
+                  row_names_side = "left",
+                  bottom_annotation=bot,
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F
+                  ##rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+draw(scca_plot_67) 
+
+pdf(file=here("output/scca_heatmap_treats.pdf"))
+draw(scca_plot_67) 
+dev.off()
+
+```
+
+
+```{r scca_risk}
+read_csv(here("data/scca_risk_miner_pheno.csv")) %>%
+  dplyr::mutate(pid=str_replace(PatientID, pattern="MM", replacement="")) %>%
+  dplyr::rename(syg_class=miner_class) ->
+  scca_risk
+
+pheno %<>% dplyr::left_join(scca_risk[, c("pid", "syg_class")]) 
+pheno$sample <- pheno$pid
+
+scca_risky <- t(apply(scca_plot, 1, getPredictedRiskMean, phen=pheno))
+
+scca_risk <- Heatmap(scca_risky,
+                  col=col_fun,
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_names_rot = 45,
+                  column_names_centered = TRUE,
+                  cluster_rows=FALSE,
+                  cluster_columns=FALSE,
+                  ##column_split = treat_num,
+                  column_title_gp = gpar(fontsize=11),
+                  row_split=row_split,
+                  border=TRUE,
+                  column_gap=unit(0.1, "mm"),
+                  row_names_gp = gpar(fontsize = 6.5),
+                  row_names_side = "left",
+                  heatmap_legend_param = list(
+                     title = "activity",
+                     legends_gp = gpar(fontsize = 4)
+                     ##grid_height = unit(3, "mm"),
+                     ##grid_width = unit(3, "mm")
+                  ),
+                  show_row_dend = F,
+                  show_column_dend = F
+                  ##rect_gp = gpar(col = "black", lwd = 0.05),
+                )
+draw(scca_risk) 
+
+pdf(file=here("output/scca_heat_risk.pdf"),
+    width=3)
+draw(scca_risk) 
+dev.off()
+
+```

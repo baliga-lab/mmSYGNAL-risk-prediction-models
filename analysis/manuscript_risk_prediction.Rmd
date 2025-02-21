@@ -1,0 +1,2718 @@
+---
+title: "Risk prediction manuscript"
+author: "Carl Murie"
+date: "`r format(Sys.Date(),'%e de %B, %Y')`"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE)
+```
+
+
+```{r libs}
+library(knitr)
+library(here)
+library(readr)
+library(tidyverse)
+library(magrittr)
+library(stringr)
+library(tibble)
+library(data.table)
+library(ggplot2)
+library(kableExtra)
+library(RNASeqUtilities)
+library(pROC)
+library(gridExtra)
+library(survival)
+library(scales)
+library(survminer)
+```
+
+```{r data}
+
+
+## gsex_risk is updated in gene_expression_panels.Rmd if you change program activity
+## in microrray_validation_miner_norm.Rmd
+## read in subtype and risk info and ensure it is ordered by risk (low to high)
+mm_risk <- read_csv(here("data/decision_tree_risk.csv")) 
+
+gse1_risk <-  read_csv(here("data/validation/GSE19784_RNA_pheno.csv"))
+gse2_risk <-  read_csv(here("data/validation/GSE24080_RNA_pheno.csv"))
+
+rate_dt <- read_csv(here::here("data/all_risk_models_summary_melt.csv"))
+  
+rate_dt$subtype <-plyr::mapvalues(rate_dt$subtype, 
+      from= c("agnostic", "del13", "del1p", "amp1q", "FGFR3", "t(4;14)"),
+      to=c("agnostic", "del(13)", "del(1p)", "amp(1q)", "FGFR3", "t(4;14)")) 
+
+rate_auc_all <- rate_dt[1:6, c(1:6)]
+
+rates <- read_csv(here("data/all_risk_models_summary.csv"))
+  
+## sky92 and gep70 panels
+gse2_gep70 <- read_csv(here("data/validation/GSE24080_gep70.csv"))
+gse2_sky92 <- read_csv(here("data/validation/GSE24080_sky92.csv"))
+##gse2_preds <-read_csv(here("output/validation/gse24080_risk_prediction_quality.csv"))
+## read in updated results for gse2
+gse2 <- read_csv(here("data/validation/GSE24080_minernorm_risk_prediction_best.csv"))
+gse2_preds <- data.frame(subject=gse2$sample, clin_risk=gse2$clin_risk, syg_risk=gse2$miner_risk, quality=gse2$miner_quality, risk_auc=gse2$auc_risk)
+
+gse1_gep70 <- read_csv(here("data/validation/GSE19784_gep70.csv"))
+gse1_sky92 <- read_csv(here("data/validation/GSE19784_sky92.csv"))
+##gse1_preds <-read_csv(here("output/validation/gse19784_risk_prediction_quality.csv"))
+## read in updated results for gse2
+gse1 <- read_csv(here("data/validation/GSE19784_minernorm_risk_prediction_best.csv"))
+gse1_preds <- data.frame(subject=gse1$sample, clin_risk=gse1$clin_risk, syg_risk=gse1$miner_risk, quality=gse1$miner_quality, risk_auc=gse1$auc_risk)
+
+ia12_sky92 <- read_csv(here("data/validation/IA12_sky92.csv"))
+ia12_gep70 <- read_csv(here("data/validation/IA12_gep70.csv"))
+
+## reattach clinical risk and write file 
+if(FALSE) {
+  gse1_risk %<>%
+    dplyr::left_join(gse1_preds[,c("subject", "clin_risk")],
+                     by=c("sample"="subject")) 
+  gse1_risk$risk <- gse1_risk$clin_risk
+  gse1_risk$PFS <- gse1_risk$D_PFS/30
+  write_csv(gse1_risk,here("data/validation/GSE19784_RNA_pheno.csv"))
+  gse2_risk %<>%
+    dplyr::left_join(gse2_preds[,c("subject", "clin_risk")],
+                     by=c("sample"="subject")) 
+  gse2_risk$risk <- gse2_risk$clin_risk
+  gse2_risk$PFS <- gse2_risk$D_PFS/30
+  write_csv(gse2_risk,here("data/validation/GSE24080_RNA_pheno.csv"))
+}
+
+
+## get updated validation data scores
+gse1_new <- read_csv(here("data/validation/GSE19784_pred_all.csv"))
+gse2_new <- read_csv(here("data/validation/GSE24080_pred_all.csv"))
+
+## get best prediction by model quality for each subject
+##train_pred <- read_csv(here("output/ia12_risk_prediction_quality.csv")) 
+
+## panel aucs
+ia12_panel_auc <- read_csv(here("data/validation/panel_aucs_train.csv"))
+GSE_panel_auc <- read_csv(here("data/validation/panel_aucs_test.csv"))
+
+subtypes <- c("all", "del13", "del1p", "amp1q", "FGFR3", "WHSC1")
+subdirs <-  c("all", "del13", "del1p", "amp1q", "FGFR3", "t414")
+subinternal <- c("all", "del13", "del1p", "amp1q", "FGFR3", "t(4;14)")
+sublabs <-  c("agnostic", "del13", "del1p", "amp1q", "FGFR3", "t(4;14)")
+
+fac_ord <- c("t(4;14)", "FGFR3", "amp1q", "del13", "del1p", "agnostic")
+
+font_size <- 4
+font_anno <- 4
+y2 <- 0.2
+
+```
+  
+
+```{r results, eval=TRUE}
+## get all SYGNAL results across all risk prediction subtypes for training
+## and test data
+
+train_res <-meds <-  NULL
+for(i in 1:length(subtypes)) {
+  out_path <- paste0(here("data/n1/"), subdirs[i], "/")
+   tmp <-  readRDS(paste0(out_path, subinternal[i], "_risk_elastic_net.Rds"))
+   pred <- cbind(tmp[[3]], tmp[[4]])
+   colnames(pred) <- c("pred", "risk", "sample", "syg_risk")
+   pred$subtype <- sublabs[i]
+   train_res <- rbind(train_res, pred)
+   
+   if(subtypes[i] != "del17p") {
+      sum_tmp <- read_csv(paste0(out_path, subtypes[i], "_summary_stats.csv"))
+      meds <- rbind(meds, sum_tmp$med_pfs)
+  }
+}
+
+dimnames(meds) <- list(sublabs, c("extreme", "high", "low"))
+rownames(meds)[1] <- "agnostic"
+
+##write_csv(here("output/"))
+
+if(FALSE) {
+## validation data
+gse1 <- gse2 <- list()
+for(sub in subtypes[c(1,6)]) {
+   tmp1 <- read_csv(paste0(here("output/prediction/"), "GSE19784_", sub,
+                    "_risk.csv"))[, c("subject", "risk", "elastic")]
+   tmp1$subtype <- sub
+   gse1[[sub]] <- tmp1
+   tmp2 <- read_csv(paste0(here("output/prediction/"), "GSE24080_", sub,
+                           "_risk.csv"))[, c("subject", "risk", "elastic")]
+   tmp2$subtype <- sub
+   gse2[[sub]] <- tmp2
+}
+
+colnames(gse1)[c(1,3)] <- colnames(gse2)[c(1,3)] <- c("sample", "pred")
+gse1$subtype[gse1$subtype=="WHSC1"] <- "t(4;14)"
+gse2$subtype[gse2$subtype=="WHSC1"] <- "t(4;14)"
+
+}
+```
+  
+
+```{r functions1}
+## get risk prediction average of A, B, or C level risk prediction models
+getRisk <- function(mat) {
+   
+   setA <- c("t(4;14)", "FGFR3")
+   setB <- c("del13", "del17p", "del1p", "amp1q")
+   setC <- c("all", "agnostic")
+   
+   ## check our C level model first
+   set0 <- mat %>% dplyr::filter(subtype %in% setC)
+   if(nrow(set0) > 0) {
+      pred <- mean(set0$pred)
+      quality <- "C"
+   }
+   
+   ## check our A level models
+   set1 <- mat %>% dplyr::filter(subtype %in% setA)
+   if(nrow(set1) > 0) {
+      pred <- mean(set1$pred)
+      quality <- "A"
+   } else {
+       ## check our B level models
+       set2 <- mat %>% dplyr::filter(subtype %in% setB)
+       if(nrow(set2) > 0) {
+          pred <- mean(set2$pred)
+          quality <- "B"
+        } ## end else2
+   } ## end else1
+   
+   return(c(pred, quality))
+} ## end getRisk
+```
+
+```{r subjects, eval=FALSE}
+## get best prediction by model quality for each subject
+## DEPRECATED: use validated risk data 
+
+## IA12 subjects
+subjects <- mm_risk$sample
+mm_risk$risk_auc <- ifelse(mm_risk$risk=="low", 0, 1)
+
+train_preds <- NULL
+for(j in subjects) {
+  tmp <- train_res %>% dplyr::filter(sample==j)
+  risky <- getRisk(tmp)
+  sub_pred <- data.frame(subject=j, syg_risk=as.numeric(risky[1]),
+                         quality=risky[2])
+  train_preds <- rbind(train_preds, sub_pred)
+}
+
+train_preds %<>%
+   dplyr::left_join(mm_risk[,c("sample", "risk_auc")], by=c("subject"="sample")) 
+
+train_preds %<>% dplyr::arrange(syg_risk)
+
+##write_csv(train_preds, here("output/ia12_risk_prediction_quality.csv"))
+```  
+  
+```{r valid_train}
+mm_risk_valid <- read_csv(here("data/decision_tree_risk_valid.csv")) 
+train_preds <- mm_risk_valid[, c("sample", "valid_pred", "quality", "risk_auc")]
+colnames(train_preds)[1:2] <- c("subject", "syg_risk")
+train_preds %<>% dplyr::arrange(syg_risk)
+```
+  
+```{r functions}  
+
+colss <- c("black", "orange", "magenta")
+shaps <- c(3, 1, 2)
+
+## assign SYGNAL class based on SYGNAL risk prediction
+getSygRisk <- function(risky) {
+  outie <- rep("low", length(risky))
+  outie[risky>0.5] <- "high"
+  outie[risky>0.6] <- "extreme"
+  return(outie)
+}
+
+## generate survival object
+getPFS <- function(survy, meth) {
+    labs <- sapply(str_split(names(survy$strata), "="), `[[`, 2)
+    counts <- survy$strata
+    names(counts) <- labs
+    risk <- unlist(lapply(labs, function(x, county=counts) rep(x, county[x])))
+    pfs <- data.frame(risk, PFS=survy$surv, time=survy$time, method=meth)
+    return(pfs)
+}
+   
+
+ ## generate pvalues for low vs extreme/high risk groups individually
+getSingleKMPval <- function(datty, lab="") {
+  
+   tmp <- data.frame(risk=c("extreme", "high"), pvalues=c(NA, NA)) 
+  
+   if(sum(datty$risk=="low") > 0) {
+   
+      if(sum(datty$risk=="high") > 0) {
+        ret <- survdiff(Surv(time=PFS, event=D_PFS_FLAG)~risk, 
+                           data=datty[datty$risk!="extreme",])
+        tmp$pvalues[2] <- broom::glance(ret)$p.value
+      }
+     
+     if(sum(datty$risk=="extreme") > 0) {
+        ret <- survdiff(Surv(time=PFS, event=D_PFS_FLAG)~risk, 
+                           data=datty[datty$risk!="high",])
+        tmp$pvalues[2] <- broom::glance(ret)$p.value
+     }
+   }
+   colnames(tmp)[2] <- lab
+   return(tmp)
+} ## getSingleKMPval
+
+## plot KM curves and return ggplot plot data and med PFS 50% object
+plotKM <- function(dat, titley, coll=colss, shapey=shaps, doPlot=TRUE) {
+  
+   dat$risk <- factor(dat$risk, levels=c("extreme", "high", "low"),
+                      ordered=TRUE)
+  
+   ## get survival plot data for each method
+    gse2_1 <- dat
+    gse2_1$risk <- gse2_1$syg_class
+    sygnal <- survfit(Surv(time=PFS, event=D_PFS_FLAG)~risk , data=gse2_1)
+    syg_pval <- survdiff(Surv(time=PFS, event=D_PFS_FLAG)~ risk, data=gse2_1)
+    syg_pval1 <- broom::glance(syg_pval)$p.value
+    pfs1 <- getPFS(sygnal, "SYGNAL")
+    
+    gse2_2 <- dat
+    gse2_2$risk <- gse2_2$gep70_class
+    gep70 <- survfit(Surv(time=PFS, event=D_PFS_FLAG)~risk , data=gse2_2)
+    pfs2 <- getPFS(gep70, "GEP70")
+    gse1_pval <- survdiff(Surv(time=PFS, event=D_PFS_FLAG)~ risk, data=gse2_2)
+    gse1_pval1 <- broom::glance(gse1_pval)$p.value
+     
+    gse2_3 <- dat
+    gse2_3$risk <- gse2_3$sky92_class
+    sky92 <- survfit(Surv(time=PFS, event=D_PFS_FLAG)~risk , data=gse2_3)
+    gse2_pval <- survdiff(Surv(time=PFS, event=D_PFS_FLAG)~ risk, data=gse2_3)
+    gse2_pval1 <- broom::glance(gse2_pval)$p.value
+    pfs3 <- getPFS(sky92, "SKY92")
+    
+    ## collect KM plot data
+    rbind(pfs1, pfs2, pfs3) %>%
+    dplyr::mutate(method=factor(method, levels=c("SYGNAL", "GEP70", "SKY92"), 
+                                ordered=TRUE)) %>%
+    dplyr::mutate(risk=factor(risk, levels=c("extreme", "high", "low"),
+                              ordered=TRUE)) -> 
+    surv_df
+    
+    ## collect med pfs 50% data
+    med_pfs <- c(summary(sygnal)$table[,7], 
+                 summary(gep70)$table[,7], 
+                 summary(sky92)$table[,7])
+    risky <- sapply(str_split(names(med_pfs), "="), `[[`, 2)
+    names(med_pfs) <- c(rep("SYGNAL", length(sygnal$strata)), 
+                        rep("GEP70", length(gep70$strata)), 
+                        rep("SKY92", length(sky92$strata)))
+    pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                          y2=rep(0,length(med_pfs)),
+                          methods=names(med_pfs),
+                          risk=risky)
+    pfs_tab$methods <- factor(pfs_tab$methods, 
+                              levels=c("SYGNAL", "GEP70", "SKY92"),
+                              ordered=TRUE)
+    
+    syg_syg <- getSingleKMPval(gse2_1, lab="mmSYGNAL")
+    syg_70 <- getSingleKMPval(gse2_2, lab="GEP70")
+    syg_92 <- getSingleKMPval(gse2_3, lab="SKY92")
+    
+    syg_syg %>%
+      dplyr::left_join(syg_70, by="risk") %>%
+      dplyr::left_join(syg_92, by="risk") ->
+      km_pvals
+    
+    g1 <- ggplot(surv_df, aes(x=time, y=PFS)) +
+      geom_point(aes( color=method, shape=risk)) + 
+      geom_line(aes(linetype=risk, color=method)) +
+        scale_color_manual(values=colss) +
+        scale_shape_manual(values=shapey, breaks=c("extreme", "high", "low")) +
+        theme_classic() +
+        theme(legend.justification=c(1,1), legend.position=c(1,1),
+              legend.background=element_rect(fill="transparent"),
+              text = element_text(size=16)) + 
+        xlab("progression free survival (months)") + ylab("survival probability") +
+        ggtitle(titley) +
+        geom_hline(yintercept = 0.5, linetype="dotted") +
+        geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2,
+                     color=methods), linetype="dashed") + labs(color="Method") +
+      guides(color=guide_legend(order=1))
+    
+    if(doPlot) {
+       print(g1)
+    }
+    
+    ## get logrank pvalues
+    pvals <-c(mmSYGNAL=syg_pval1, gse1=gse1_pval1, gse2=gse2_pval1)
+    
+    return(list(surv_df, pfs_tab, km_pvals, g1, pvals))
+}
+
+
+## plot ROC 
+plotROC <- function(dat, titley,  font_anno=4, coll=colss, doPlot=TRUE) {
+  
+   num <- nrow(dat)
+  
+    ## results from each subjects best models based on subtype (A, B, C)
+    rocc1 <- roc(response=dat$risk_auc, predictor=dat$syg_risk)
+    sygnal_auc <- signif(auc(rocc1)[1],3)
+    roc_dat <- data.frame(FPR=rev(1-rocc1$specificities),
+                          TPR=rev(rocc1$sensitivities),
+                          method="SYGNAL")
+    
+    ## gep70 roc curve
+    rocc2 <- roc(response=dat$risk_auc, predictor=dat$gep70)
+    gep70_auc <- signif(auc(rocc2)[1],3)
+    roc_dat <- rbind(roc_dat, data.frame(FPR=rev(1-rocc2$specificities),
+                              TPR=rev(rocc2$sensitivities),
+                              method="GEP70"))
+    
+    ## sky92 roc curve
+    rocc3 <- roc(response=dat$risk_auc, predictor=dat$sky92)
+    sky92_auc <- signif(auc(rocc3)[1],3)
+    roc_dat <- rbind(roc_dat, data.frame(FPR=rev(1-rocc3$specificities),
+                              TPR=rev(rocc3$sensitivities),
+                              method="SKY92"))
+    
+    roc_dat %<>% dplyr::mutate(method=factor(method, 
+                                             levels=c("SYGNAL", "GEP70", "SKY92"),
+                                             ordered=TRUE))
+    
+    auc_lab <- data.frame(aucs=c(sygnal_auc, gep70_auc, sky92_auc),
+                          x_val=c(0.75, 0.75, 0.75),
+                          y_val=c(0.3, 0.25, 0.2),
+                          cols=coll)
+    
+    g1 <- ggplot(roc_dat, aes(x=FPR, y=TPR, color=method)) + geom_line(size = 2, alpha = 0.7) +
+      scale_color_manual(values=coll) +
+      theme_classic() +
+      labs(title=titley,  x = "False Positive Rate",  
+               y = "True Positive Rate") +
+      annotate('text', x=0.90, y=0.35, label="n", color="black", 
+                        fontface = 'bold', size=font_anno) +
+      annotate('text', x=0.90, y=0.30, label=num, color="black", 
+                        fontface = 'bold', size=font_anno) +
+      annotate('text', x=0.75, y=0.35, label="AUC", color="black", 
+                        fontface = 'bold', size=font_anno) +
+      annotate('text', x=auc_lab$x_val, y=auc_lab$y_val, label=auc_lab$aucs,
+                        color=auc_lab$cols, fontface = 'bold', size=font_anno) +
+      geom_abline(slope=1, intercept=0, linetype="dashed") + 
+      theme(plot.title = element_text(size = 12, face = "bold"),
+        legend.title=element_text(size=12), 
+        legend.text=element_text(size=10)) +
+       theme(text = element_text(size=15)) +
+       guides(color=guide_legend(order=1))
+    
+    if(doPlot) {
+       print(g1)
+    }
+    return(list(roc_dat, auc_lab, g1))
+}
+```  
+
+
+## Plot Survival vs Guan score  
+  
+```{r guanscore}
+
+mm_risk %>%
+  dplyr::select(sample, D_PFS_FLAG, PFS, GuanScore, risk) %>%
+  dplyr::mutate(data="IA12") ->
+  ia12_guan
+
+gse1_risk %>%
+  dplyr::select(sample, D_PFS_FLAG, PFS, GuanScore, risk) %>%
+  dplyr::mutate(data="GSE19784") ->
+  gse1_guan
+
+gse2_risk %>%
+  dplyr::select(sample, D_PFS_FLAG, PFS, GuanScore, risk) %>%
+  dplyr::mutate(data="GSE24080") ->
+  gse2_guan
+
+
+all_guan <- rbind(ia12_guan, gse1_guan, gse2_guan)
+all_guan$data <- factor(all_guan$data, levels=c("IA12", "GSE19784", "GSE24080"),
+                        ordered=TRUE)
+all_guan$relapse <- factor(all_guan$D_PFS_FLAG, levels=c(0, 1),
+                        labels=c(FALSE, TRUE))
+
+ggplot(all_guan, aes(x=risk, y=GuanScore, fill=risk)) + geom_violin() +
+  geom_jitter(aes(color=relapse), width=0.05, size=0.2, alpha=0.5) +
+  facet_wrap(~data, ncol=1) +
+  scale_color_manual(values=c("black", "orange")) 
+
+g1 <- ggplot(all_guan, aes(x=risk, y=GuanScore, fill=risk)) + geom_violin() +
+  geom_jitter(aes(color=relapse), width=0.05, size=0.2, alpha=0.5) +
+  facet_wrap(~data, ncol=1) +
+  scale_color_manual(values=c("black", "orange")) +
+  guides(color="none", fill="none")
+
+g2 <- ggplot(all_guan, aes(x=risk, y=PFS, fill=risk)) + geom_violin() +
+  geom_jitter(aes(color=relapse), width=0.05, size=0.2, alpha=0.5) +
+  facet_wrap(~data, ncol=1) +
+  scale_color_manual(values=c("black", "orange")) +
+  guides(color="none", fill="none")
+
+grid.arrange(grobs=list(g2, g1), nrow=1)
+```
+  
+
+```{r combo}
+
+## generated from IA12 training data using inflection points
+cutty <- read_csv(here(paste0("data/validation/panel_cut_Nov.csv")))
+cutty %>% 
+  dplyr::filter(data=="IA12") %>%
+  dplyr::select(sky92) -> 
+  sky92_inf  
+
+cutty %>% 
+  dplyr::filter(data=="IA12") %>%
+  dplyr::select(gep70) -> 
+  gep70_inf
+
+## IA12
+ia12_70 <- data.frame(sample=ia12_gep70$sample,
+                      gep70=ia12_gep70$scores,
+                      gep70_class=ia12_gep70$class)
+
+ia12_92 <- data.frame(sample=ia12_sky92$sample,
+                      sky92=ia12_sky92$scores,
+                      sky92_class=ia12_sky92$class)
+
+mm_risk %>%
+  dplyr::left_join(ia12_70, by="sample") %>%
+  dplyr::left_join(ia12_92, by="sample") %>%
+  dplyr::left_join(train_preds, by=c("sample"="subject")) %>%
+  dplyr::mutate(syg_class=getSygRisk(syg_risk)) %>%
+  dplyr::mutate(risk_auc=ifelse(risk=="low", 0, 1)) %>%
+  dplyr::mutate(syg_class=factor(syg_class, levels=c("low", "extreme", "high"))) %>%
+  dplyr::mutate(sky92_class=factor(sky92_class, levels=c("low","extreme","high")))%>%
+  dplyr::mutate(gep70_class=factor(gep70_class, levels=c("low","extreme","high"))) ->
+  ia12_pheno
+
+write_csv(ia12_pheno, here("output/ia12_res_high_quality.csv"))
+
+## ia12 results by subtype, add panel scores
+train_res %>%
+  dplyr::left_join(ia12_70, by="sample") %>%
+  dplyr::left_join(ia12_92, by="sample") %>%
+  dplyr::mutate(risk_auc=ifelse(risk=="low", 0, 1)) %>%
+  dplyr::rename(syg_class=syg_risk) %>%
+  dplyr::rename(syg_risk=pred) %>%
+  dplyr::select(-risk) %>%
+  dplyr::left_join(ia12_pheno[, c("sample", "PFS", "D_PFS_FLAG", "risk",
+                                  "GuanScore")], by="sample") ->
+ia12_subtype
+
+write_csv(ia12_subtype, here("output/ia12_res_subtype.csv"))
+
+## GSE19784
+
+## updated results with original microarray data
+gse1_new <- read_csv(here("data/validation/GSE19784_pred_all.csv"))
+gse1_70 <- data.frame(sample=gse1_new$sample,
+                      gep70=gse1_new$gep70_scores,
+                      gep70_class=gse1_new$gep70_class)
+
+gse1_92 <-data.frame(sample=gse1_new$sample,
+                      sky92=gse1_new$sky92_scores,
+                      sky92_class=gse1_new$sky92_class)
+
+gse1_syg <-data.frame(sample=gse1_new$sample,
+                      syg_risk=gse1_new$syg_risk,
+                      syg_class=gse1_new$syg_class)
+
+gse1_risk %>%
+  dplyr::left_join(gse1_70, by="sample") %>%
+  dplyr::left_join(gse1_92, by="sample") %>%
+  dplyr::left_join(gse1_syg, by="sample") %>%
+  dplyr::mutate(risk_auc=plyr::mapvalues(risk, 
+                                         from=c("low", "high", "extreme"),
+                                         to=c(0,1,1))) ->
+  gse1_pheno
+
+write_csv(gse1_pheno, here("output/GSE19784_res.csv"))
+
+gse2_new <- read_csv(here("data/validation/GSE24080_pred_all.csv"))
+gse2_70 <- data.frame(sample=gse2_new$sample,
+                      gep70=gse2_new$gep70_scores,
+                      gep70_class=gse2_new$gep70_class)
+
+gse2_92 <-data.frame(sample=gse2_new$sample,
+                     sky92=gse2_new$sky92_scores,
+                     sky92_class=gse2_new$sky92_class) 
+
+gse2_syg <-data.frame(sample=gse2_new$sample,
+                      syg_risk=gse2_new$syg_risk,
+                      syg_class=gse2_new$syg_class)
+gse2_risk %>%
+  dplyr::left_join(gse2_70, by="sample") %>%
+  dplyr::left_join(gse2_92, by="sample") %>%
+  dplyr::left_join(gse2_syg, by="sample") %>%
+  dplyr::mutate(risk_auc=plyr::mapvalues(risk, 
+                                         from=c("low", "high", "extreme"),
+                                         to=c(0,1,1))) ->
+  gse2_pheno
+
+write_csv(gse2_pheno, here("output/GSE24080_res.csv"))
+```
+  
+# **Risk prediction summary by quality of model**  
+
+## **Summary statistics by subtype**  
+  
+```{r subb}
+
+sub_cols <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+          "#F0E442", "#0072B2", "#D55E00")
+names(sub_cols) <-rates$subtype
+
+rate_dt$subtype <- factor(rate_dt$subtype, levels=unique(rate_dt$subtype),
+                          ordered=TRUE)
+rate_dt$rate_type <- factor(rate_dt$rate_type, levels=unique(rate_dt$rate_type),
+                          ordered=TRUE)
+
+ggplot(rate_dt, aes(x=subtype, y=value, fill=subtype)) +
+  geom_bar( stat="identity", position="dodge") +
+  facet_grid(rate_type~risk_type) +
+  xlab("risk category rates") + ylab("percentages") +
+  theme(axis.text.x=element_blank()) +
+  theme(legend.title = element_text(color = "black", size = 6),
+        legend.text = element_text(color = "black", size = 6)) +
+  ##guides(shape = guide_legend(override.aes = list(size = 0.5))) +
+  scale_fill_manual(values=sub_cols) +
+  theme(aspect.ratio=2/4)
+
+tprs <- rates[,c("subtype", "l_TPR", "h_TPR", "x_TPR")]
+fprs <- rates[,c("subtype", "l_FPR", "h_FPR", "x_FPR")]
+colnames(tprs) <- colnames(fprs) <- c("subtype", "low", "high/extreme", "extreme")
+
+prs_all <- cbind(tprs, fprs[, -1])
+```
+  
+`r headerKable(prs_all, title="true and false positive percentages") %>% add_header_above(header=c(" "=1, TPR=3, FPR=3))`  
+
+```{r quality}
+models <- rates[,c("subtype", "AUC", "quality")]
+models$subtype <- c("FGFR3", "t(4;14)", "del(13)", 
+                    "del(1p)", "amp(1q)", "agnostic")
+models$AUC[3] <- "0.890"
+```
+  
+SYGNAL risk prediction for each subject was chosen based on the quality of the subtypes each subject exhibited. If a subject exhibited multiple subtypes then the average of the best quality models risk prediction was used to classify the subject. If no subtypes were exhibited then the "all" model was used. For example, if a subject exhibited the t(4;14), amp1q, and del(1p) subtypes then the t(4;14) subdtype risk prediction would be used for that subject. 
+
+`r headerKable(models, digitts=3)`
+
+`r headerKable(rate_auc_all, digitts=3)`
+  
+## **IA12** {.tabset .tabset-pills}  
+
+### **Scatter plots by subtype**  
+
+```{r mm_scatter}
+ia12_syg_dt <- data.table::melt(data.table(ia12_subtype), 
+                      id.vars=c("sample", "subtype", "PFS", "GuanScore", "risk"),
+                      measure.vars=c("syg_risk", "sky92", "gep70"))
+
+levs <- c("t(4;14)", "FGFR3", "amp1q", "del13", "del1p", "agnostic")
+labelss <- c("t(4;14)", "FGFR3", "amp(1q)", "del(13)", "del(1p)", "agnostic")
+
+ia12_syg_dt %<>%
+  dplyr::mutate(subtype=factor(subtype, levels=levs, labels=labelss,
+                               ordered=TRUE)) %<>%
+  dplyr::mutate(variable=factor(variable, levels=c("syg_risk", "sky92", "gep70"),
+                          labels=c("mmSYGNAL", "SKY92", "GEP70"),
+                          ordered=TRUE))
+
+mm_cors <- ia12_syg_dt[,cor(PFS, value), by=.(subtype, variable)]
+mm_tab_pfs <- cbind(subtype=as.character(mm_cors$subtype[6:1]),
+                data.frame(matrix(signif(mm_cors$V1,3), ncol=3)))
+colnames(mm_tab_pfs) <- c("subtype", "mmSYGNAL", "SKY92", "GEP70")
+
+mm_cors <- ia12_syg_dt[,cor(GuanScore, value), by=.(subtype, variable)]
+mm_tab_guan <- cbind(subtype=as.character(mm_cors$subtype[6:1]),
+                data.frame(matrix(signif(mm_cors$V1,3), ncol=3)))
+colnames(mm_tab_guan) <- c("subtype", "mmSYGNAL", "SKY92", "GEP70")
+
+ggplot(ia12_syg_dt, aes(x=PFS, y=value)) + 
+  geom_point(aes(color=risk), size=0.25) +
+  ggtitle("PFSm") + 
+  geom_smooth(method="lm") +
+  facet_grid(subtype ~variable, scales="free_y") 
+ggsave(here("output/ia12_PFS_scatter.pdf"))
+
+ggplot(ia12_syg_dt, aes(x=GuanScore, y=value)) + 
+  geom_point(aes(color=risk), size=0.25) +
+  ggtitle("GuanScore") + 
+  geom_smooth(method="lm") +
+  facet_grid(subtype ~variable, scales="free_y") 
+ggsave(here("output/ia12_Guan_scatter.pdf"))
+
+```
+  
+`r headerKable(mm_tab_pfs, title="ia12 PFS cors")`  
+  
+`r headerKable(mm_tab_guan, title="ia12 Guan cors")`  
+
+  
+### **Full model: highest quality**  
+  
+```{r roc1}
+ia12_tmp <- plotROC(ia12_pheno, titley="IA12")
+ia12_roc <- ia12_tmp[[1]]
+ia12_roc$data <- "IA12"
+ia12_auc <- ia12_tmp[[2]]
+ia12_gg <- ia12_tmp[[3]]
+
+ia12_tmp <- plotKM(ia12_pheno, titley="IA12")
+ia12_surv <- ia12_tmp[[1]]
+ia12_surv$data <- "IA12"
+ia12_pfs <- ia12_tmp[[2]]
+ia12_pvals <- ia12_tmp[[3]]
+ia12_km <- ia12_tmp[[4]]
+
+ia_tab <- data.table::dcast(data.table(ia12_pfs[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+ia_hq <- ia_tab
+```
+   
+`r headerKable(ia_tab, title="50% survival probability PFS (months)")`    
+  
+`r headerKable(ia12_pvals, title="logrank FDR values", digitts=3)`
+  
+### **t(4;14)**  
+  
+```{r roc2}
+ 
+ia12_subtype %>%
+  dplyr::filter(subtype=="t(4;14)") %>%
+  dplyr::mutate(risk=factor(risk, levels=c("extreme", "high", "low"), 
+                            ordered=TRUE)) ->
+  ia12_t
+
+g_t4 <- plotROC(ia12_t, title="IA12: t(4;14)")
+ia12_t414_roc <- g_t4[[1]]
+
+ia12_t414_auc <- g_t4[[2]]
+ia12_t414_auc$method <- c("mmSYGNAL", "GEP70", "SKY92")
+ia12_t414_roc$data <- "IA12"
+ia12_t414_roc$subtype <- "t(4;14)"
+
+ia12_tmp <- plotKM(ia12_t, titley="IA12: t(4;14)")
+ia12_surv_t4 <- ia12_tmp[[1]]
+
+ia12_surv_t4$data <- "IA12"
+ia12_surv_t4$subtype <- "t(4;14)"
+
+ia12_pfs_t4 <- ia12_tmp[[2]]
+ia12_pfs_t4$subtype <- "t(4;14)"
+ia12_pvals_t4 <- ia12_tmp[[3]]
+
+ia_tab_t4 <- data.table::dcast(data.table(ia12_pfs_t4[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+```
+   
+`r headerKable(ia_tab_t4, title="50% survival probability PFS (months)")`    
+  
+`r headerKable(ia12_pvals_t4, title="logrank FDR values", digitts=3)`   
+   
+### **FGFR3**  
+  
+```{r roc3}
+ 
+ia12_subtype %>%
+  dplyr::filter(subtype=="FGFR3") ->
+  ia12_t
+
+fgfr3_roc <- plotROC(ia12_t, title="IA12: FGFR3")
+ia12_fgfr3_roc <- fgfr3_roc[[1]]
+
+ia12_fgfr3_auc <- fgfr3_roc[[2]]
+ia12_fgfr3_auc$method <- c("mmSYGNAL", "GEP70", "SKY92")
+ia12_fgfr3_roc$data <- "IA12"
+ia12_fgfr3_roc$subtype <- "FGFR3"
+
+ia12_tmp <- plotKM(ia12_t, title="IA12: FGFR3")
+ia12_surv_fgfr3 <- ia12_tmp[[1]] 
+
+ia12_surv_fgfr3$data <- "IA12"
+ia12_surv_fgfr3$subtype <- "FGFR3"
+
+ia12_pfs_fgfr3 <- ia12_tmp[[2]]
+ia12_pfs_fgfr3$subtype <- "FGFR3"
+ia12_pvals_fgfr3 <- ia12_tmp[[3]]
+
+ia_tab <- data.table::dcast(data.table(ia12_pfs_fgfr3[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+
+```
+   
+`r headerKable(ia_tab, title="50% survival probability PFS (months)")`    
+    
+`r headerKable(ia12_pvals, title="logrank FDR values", digitts=3)`
+
+### **del(1p)**  
+  
+```{r roc4}
+ 
+ia12_subtype %>%
+  dplyr::filter(subtype=="del1p") ->
+  ia12_t
+
+g_t4 <- plotROC(ia12_t, title="IA12: del(1p)")
+ia12_del1p_roc <- g_t4[[1]] 
+
+ia12_del1p_auc <- g_t4[[2]]
+ia12_del1p_auc$method <- c("mmSYGNAL", "GEP70", "SKY92")
+ia12_del1p_roc$data <- "IA12"
+ia12_del1p_roc$subtype <- "del(1p)"
+
+ia12_tmp <- plotKM(ia12_t, title="IA12: del(1p)")
+ia12_surv_del1p <- ia12_tmp[[1]]
+
+ia12_surv_del1p$data <- "IA12"
+ia12_surv_del1p$subtype <- "del(1p)"
+
+ia12_pfs_del1p <- ia12_tmp[[2]]
+ia12_pfs_del1p$subtype <- "del(1p)"
+ia12_pvals_del1p <- ia12_tmp[[3]]
+
+ia_tab <- data.table::dcast(data.table(ia12_pfs_del1p[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+
+```
+  
+`r headerKable(ia_tab, title="50% survival probability PFS (months)")`    
+  
+`r headerKable(ia12_pvals, title="logrank FDR values", digitts=3)`  
+  
+### **del(13)**  
+  
+```{r roc5}
+ 
+ia12_subtype %>%
+  dplyr::filter(subtype=="del13") ->
+  ia12_t
+
+g_t4 <- plotROC(ia12_t, title="IA12: del(13)")
+ia12_del13_roc <- g_t4[[1]]
+
+ia12_del13_auc <- g_t4[[2]]
+ia12_del13_auc$method <- c("mmSYGNAL", "GEP70", "SKY92")
+ia12_del13_roc$data <- "IA12"
+ia12_del13_roc$subtype <- "del(13)"
+
+ia12_tmp <- plotKM(ia12_t, title="IA12: del(13)")
+ia12_surv_del13 <- ia12_tmp[[1]] 
+
+ia12_surv_del13$data <- "IA12"
+ia12_surv_del13$subtype <- "del(13)"
+ia12_pfs_del13 <- ia12_tmp[[2]]
+ia12_pfs_del13$subtype <- "del(13)"
+ia12_pvals_del13 <- ia12_tmp[[3]]
+
+
+ia_tab <- data.table::dcast(data.table(ia12_pfs_del13[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+```
+  
+`r headerKable(ia_tab, title="50% survival probability PFS (months)")`    
+  
+`r headerKable(ia12_pvals, title="logrank FDR values", digitts=3)`  
+  
+### **amp(1q)**  
+  
+```{r roc6}
+ 
+ia12_subtype %>%
+  dplyr::filter(subtype=="amp1q") ->
+  ia12_t
+
+g_t4 <- plotROC(ia12_t, title="IA12: amp(1q)")
+ia12_amp1q_roc <- g_t4[[1]] 
+
+ia12_amp1q_auc <- g_t4[[2]]
+ia12_amp1q_auc$method <- c("mmSYGNAL", "GEP70", "SKY92")
+ia12_amp1q_roc$data <- "IA12"
+ia12_amp1q_roc$subtype <- "amp(1q)"
+
+ia12_tmp <- plotKM(ia12_t, title="IA12: amp(1q)")
+ia12_surv_amp1q <- ia12_tmp[[1]] 
+
+ia12_surv_amp1q$data <- "IA12"
+ia12_surv_amp1q$subtype <- "amp(1q)"
+ia12_pfs_amp1q <- ia12_tmp[[2]]
+ia12_pfs_amp1q$subtype <- "amp(1q)"
+ia12_pvals_amp1q <- ia12_tmp[[3]]
+
+ia_tab <- data.table::dcast(data.table(ia12_pfs_amp1q[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+```
+  
+`r headerKable(ia_tab, title="50% survival probability PFS (months)")`    
+  
+`r headerKable(ia12_pvals, title="logrank FDR values", digitts=3)`
+  
+### **agnostic**  
+  
+```{r roc7}
+ 
+ia12_subtype %>%
+  dplyr::filter(subtype=="agnostic") ->
+  ia12_t
+
+g_t4 <- plotROC(ia12_t, title="IA12: agnostic")
+ia12_ag_roc <- g_t4[[1]]
+
+ia12_ag_auc <- g_t4[[2]]
+ia12_ag_auc$method <- c("mmSYGNAL", "GEP70", "SKY92")
+ia12_ag_roc$subtype <- "agnostic"
+ia12_ag_roc$data <- "IA12"
+
+ia12_tmp <- plotKM(ia12_t, title="IA12: agnositc")
+ia12_surv_ag <- ia12_tmp[[1]]
+
+ia12_surv_ag$data <- "IA12"
+ia12_surv_ag$subtype <- "agnostic"
+
+ia12_pfs_ag <- ia12_tmp[[2]]
+ia12_pfs_ag$subtype <- "agnostic"
+ia12_pvals_ag <- ia12_tmp[[3]]
+
+ia_tab <- data.table::dcast(data.table(ia12_pfs_ag[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+```
+  
+`r headerKable(ia_tab, title="50% survival probability PFS (months)")`    
+  
+`r headerKable(ia12_pvals, title="logrank FDR values", digitts=3)`
+  
+## Subtype specific models  
+  
+```{r sub_plotty}
+
+collls <- c("#000000", "#E69F00", "#56B4E9", "#009E73",
+          "#F0E442", "#0072B2")
+
+sub_roc <- rbind(ia12_t414_roc, ia12_fgfr3_roc, ia12_del1p_roc, ia12_del13_roc,
+                 ia12_amp1q_roc, ia12_ag_roc)
+sub_roc$method <- factor(sub_roc$method, levels=unique(sub_roc$method),
+                         labels=c("mmSYGNAL", "GEP70", "SKY92"), ordered=TRUE)
+sub_roc$subtype <- factor(sub_roc$subtype, 
+        levels=c("FGFR3","t(4;14)", "del(13)", "del(1p)", "amp(1q)", "agnostic"),
+        ordered=TRUE)
+
+syg_auc <- rbind(ia12_fgfr3_auc[1,], ia12_t414_auc[1,], ia12_del1p_auc[1,],
+                 ia12_del13_auc[1,], ia12_amp1q_auc[1,], ia12_ag_auc[1,])
+gep_auc <- rbind(ia12_fgfr3_auc[2,], ia12_t414_auc[2,], ia12_del1p_auc[2,],
+                 ia12_del13_auc[2,], ia12_amp1q_auc[2,], ia12_ag_auc[2,])
+sky_auc <- rbind(ia12_fgfr3_auc[3,], ia12_t414_auc[3,], ia12_del1p_auc[3,],
+                 ia12_del13_auc[3,], ia12_amp1q_auc[3,], ia12_ag_auc[3,])
+
+syg_auc$subtype <- gep_auc$subtype <- sky_auc$subtype <- 
+  c("FGFR3","t(4;14)", "del(13)", "del(1p)", "amp(1q)", "agnostic")
+colnames(syg_auc)[2:3] <- colnames(gep_auc)[2:3] <- colnames(sky_auc)[2:3] <- 
+  c("FPR", "TPR")
+syg_auc$TPR <- gep_auc$TPR <- sky_auc$TPR <-c(0.50, 0.42, 0.36, 0.3, 0.24, 0.18)
+
+x_spot <- 0.70
+syg_auc$FPR <- x_spot
+
+syg_roc <- sub_roc %>% dplyr::filter(method=="mmSYGNAL")
+
+## add sample size and quality
+labbs <- apply(rate_dt[1:6, c("subtype", "quality", "n")], 1, paste, collapse=" ")
+syg_roc %<>%
+  dplyr::mutate(sub_lab=plyr::mapvalues(subtype, from=unique(subtype), to=labbs[c(2,1,3,5,4,6)]))
+
+auc_lab <- apply(rate_dt[1:6,c("subtype", "AUC", "quality", "n")], 1, paste, collapse=" ")
+auc_plot <- data.frame(aucs=auc_lab, FPR=x_spot, TPR=c(0.32, 0.26, 0.20, 0.14, 0.08, 0.02))
+
+gg_sub <- ggplot(syg_roc, aes(x=FPR, y=TPR)) + 
+  geom_line(aes(color=sub_lab), size = 1, alpha = 0.5) +
+  scale_color_manual(values=collls) +
+  theme_light() +
+  labs(x = "False Positive Rate", y = "True Positive Rate") +
+       ##color="Subtype Quality n") +
+   geom_abline(slope=1, intercept=0, linetype="dashed") +
+  guides(color = "none") +
+  theme(plot.title = element_text(size=12),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=12),
+    text = element_text(size=15),
+    axis.text.y= element_text(size=12, angle=0, hjust=1),
+    axis.text.x= element_text(size=12, angle=45, hjust=1),
+    axis.title = element_text(size=13)) +
+   theme(aspect.ratio = 1) +
+  annotate('text', x=x_spot, y=0.38, label="Subtype AUC Quality  n", color="black", 
+                    fontface = 'bold', size=4) +
+  geom_text(data=auc_plot, label=auc_plot$aucs, color=collls, size=4.5,
+            fontface="bold")
+print(gg_sub)
+ggsave(here("output/subtype_SYGNAL_ROC.pdf"))
+
+## ROC graph
+##colnames(q_auc)[2:3] <- c("FPR", "TPR")
+##q_auc$TPR <- c(0.32, 0.24, 0.16)
+ggplot(sub_roc, aes(x=FPR, y=TPR)) + 
+  geom_line(aes(color=subtype), size = 0.5, alpha = 0.5) +
+  scale_color_manual(values=collls) +
+  theme_light() +
+  labs(title="subtype specific risk models",  x = "False positive rate",  
+           y = "True positive rate") +
+  guides(color = FALSE) +
+  facet_wrap(~fct_relevel(method ,"mmSYGNAL", "GEP70", "SKY92"), ncol=3) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme(plot.title = element_text(size=9, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=12),
+    text = element_text(size=12),
+    axis.text.y= element_text(size=10, angle=0, hjust=1,face="bold"),
+    axis.text.x= element_text(size=10, angle=45, hjust=1,face="bold"),
+    strip.background = element_rect(
+          color="black", fill="white", size=0.25, linetype="solid"),
+        strip.text = element_text(size = 8, color = "black", face = "bold")) +
+   theme(aspect.ratio = 1) +
+  annotate('text', x=0.75, y=0.60, label="AUC", color="black", 
+                    fontface = 'bold', size=3) +
+  geom_text(data=syg_auc, label=syg_auc$aucs, color=collls, size=3) +
+  geom_text(data=gep_auc, label=gep_auc$aucs, color=collls, size=3) +
+  geom_text(data=sky_auc, label=sky_auc$aucs, color=collls, size=3) 
+
+ggsave(here("output/subtype_ROC.pdf"))
+
+ggplot(sub_roc, aes(x=FPR, y=TPR)) + 
+  geom_line(aes(color=subtype), size = 0.5, alpha = 0.5) +
+  scale_color_manual(values=collls) +
+  theme_light() +
+  labs(title="subtype specific risk models",  x = "False Positive Rate",  
+           y = "True Positive Rate") +
+  guides(color = guide_legend(override.aes = list(size = 1))) +
+  facet_wrap(~fct_relevel(method ,"mmSYGNAL", "GEP70", "SKY92"), ncol=3) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme(plot.title = element_text(size=9, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=12),
+    text = element_text(size=12),
+    axis.text= element_text(size=10, angle=0, hjust=1,face="bold"),
+    strip.background = element_rect(
+          color="black", fill="white", size=0.25, linetype="solid"),
+        strip.text = element_text(size = 8, color = "black", face = "bold")) +
+   theme(aspect.ratio = 1) +
+  annotate('text', x=0.75, y=0.60, label="AUC", color="black", 
+                    fontface = 'bold', size=3) +
+  geom_text(data=syg_auc, label=syg_auc$aucs, color=collls, size=3) +
+  geom_text(data=gep_auc, label=gep_auc$aucs, color=collls, size=3) +
+  geom_text(data=sky_auc, label=sky_auc$aucs, color=collls, size=3) 
+ggsave(here("output/subtype_ROC_legend.pdf"))
+```
+   
+```{r subby_km, eval=TRUE}
+
+## combine KM subtype specific data
+sub_all <- rbind(ia12_surv_t4, ia12_surv_fgfr3, ia12_surv_del1p, ia12_surv_del13,
+                 ia12_surv_amp1q, ia12_surv_ag)
+sub_all$subtype <- factor(sub_all$subtype, 
+        levels=c("FGFR3","t(4;14)", "del(13)", "del(1p)", "amp(1q)", "agnostic"),
+        ordered=TRUE)
+
+sub_km <- sub_all %>% dplyr::filter(method=="SYGNAL")
+
+## Survival curves
+ggplot(sub_km, aes(x=time, y=PFS)) +
+  geom_point(aes( color=subtype), size=0.3, alpha=0.5) + 
+  geom_line(aes(color=subtype), size=0.25) +
+  scale_color_manual(values=collls) +
+  ##scale_shape_manual(values=shaps, breaks=c("extreme", "high", "low")) +
+  theme_light() +
+  facet_wrap(~risk) +
+  guides(color = guide_legend(override.aes = list(size = 1))) +
+  theme(legend.justification=c(1,1), 
+        ##legend.position=c(1,1), 
+        legend.background=element_rect(fill="transparent"),
+        text = element_text(size=12),
+        legend.title=element_text(size=10), 
+        legend.text=element_text(size=10),
+        ##legend.spacing.y = unit(2, 'pt'),
+        ##legend.margin=unit(1, "mm")
+        axis.text= element_text(size=10, angle=0, hjust=1, face="bold"),
+        strip.background = element_rect(
+          color="black", fill="white", size=0.25, linetype="solid"),
+        strip.text = element_text(size = 8, color = "black", face = "bold")
+        ##axis.text.y= element_text(size=14, angle=0, hjust=1)
+        ) +
+  xlab("PFS (months) actual outcome") + ylab("survival probability") +
+  geom_hline(yintercept = 0.5, linetype="dotted") +
+  theme(aspect.ratio = 1) 
+
+ggsave(here("output/subtype_KM.pdf"))
+
+## KM plot 
+## combine med 50% PFS
+full_pfs <- rbind( ia12_pfs_fgfr3, ia12_pfs_t4, ia12_pfs_del13, ia12_pfs_del1p,  ia12_pfs_amp1q, ia12_pfs_ag)
+
+syg_pfs <- full_pfs %>% dplyr::filter(methods=="SYGNAL")
+
+ggplot(full_pfs, aes(x=risk, y=pfs, fill=risk)) + 
+  geom_bar(stat="identity", position="dodge") + 
+  facet_grid(fct_relevel(subtype,"FGFR3","t(4;14)", "del(13)", "del(1p)", "amp(1q)", "agnostic")~methods) + 
+  xlab("predicted risk") +
+  ylab("median 50% PFS (months) actual outcome") +
+  theme(axis.text.x= element_text(size=12, angle=45, hjust=1, face="bold"),
+        axis.text.y= element_text(size=12, face="bold"),
+        axis.title=element_text(size=14),
+        strip.background = element_rect(
+          color="black", fill="white", size=0.25, linetype="solid"),
+        strip.text = element_text(size = 10, color = "black", face = "bold"))
+ggsave(here("output/subtype_PFS.pdf"))
+
+
+ia_pfs_all <- rbind(data.frame(subtype="t(4;14)", ia12_pfs_t4[1,2:4]),
+                    data.frame(subtype="FGFR3", ia12_pfs_fgfr3[1,2:4]),
+                    data.frame(subtype="del(13)", ia12_pfs_del13[1,2:4]),
+                    data.frame(subtype="del(1p)", ia12_pfs_del1p[1,2:4]),
+                    data.frame(subtype="amp(1q)", ia12_pfs_amp1q[1,2:4]),
+                    data.frame(subtype="agnostic", ia12_pfs_ag[1,2:4]))
+
+```
+   
+## Quality models  
+  
+```{r ia12_rocquality, eval=TRUE}
+
+## results from A models
+train_preds %>%
+   dplyr::filter(quality=="A") ->
+   train_A 
+
+##t1 <- table(train_A$risk_auc, train_A$syg_class)
+##tprs <- rbind(tprs, data.frame(subtype="A", tpr=signif(t1[2,1]/(sum(t1[2,])), 3)*100))
+
+
+##tab1 <- rbind(tab1, data.frame(quality="A", n=nrow(train_A)))
+
+rocc2 <- roc(response=train_A$risk_auc, predictor=train_A$syg_risk)
+ia_auc <- signif(auc(rocc2)[1],3)
+roc_dat <- data.frame(FPR=rev(1-rocc2$specificities),
+                      TPR=rev(rocc2$sensitivities))
+
+g2 <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 2, alpha = 0.7) +
+      labs(title= "IA12 ROC: A models",  x = "False Positive Rate",  
+           y = "True Positive Rate") +
+           annotate('text', x=0.75, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=font_size) +
+           annotate('text', x=0.75, y=y2, label=ia_auc, color="black", 
+                    fontface = 'bold', size=font_size) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme(plot.title = element_text(size = 12, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=15))
+
+## results from B models
+train_preds %>%
+   dplyr::filter(quality=="B") ->
+   train_B 
+
+##t1 <- table(train_B$risk_auc, train_B$syg_class)
+##tprs <- rbind(tprs, data.frame(subtype="B", tpr=signif(t1[2,1]/(sum(t1[2,])), 3)*100))
+
+
+rocc3 <- roc(response=train_B$risk_auc, predictor=train_B$syg_risk)
+ia_auc <- signif(auc(rocc3)[1],3)
+roc_dat <- data.frame(FPR=rev(1-rocc3$specificities),
+                      TPR=rev(rocc3$sensitivities))
+
+g3 <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 2, alpha = 0.7) +
+      labs(title= "IA12 ROC: B models",  x = "False Positive Rate",  
+           y = "True Positive Rate") +
+           annotate('text', x=0.75, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=font_size) +
+           annotate('text', x=0.75, y=y2, label=ia_auc, color="black", 
+                    fontface = 'bold', size=font_size) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme(plot.title = element_text(size = 12, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=15))
+
+## results from C models
+train_preds %>%
+   dplyr::filter(quality=="C") ->
+   train_C 
+
+
+##t1 <- table(train_C$risk_auc, train_C$syg_class)
+##tprs <- rbind(tprs, data.frame(subtype="C", tpr=signif(t1[2,1]/(sum(t1[2,])), 3)*100))
+
+##tab1 <- rbind(tab1, data.frame(quality="C", n=nrow(train_C)))
+
+rocc4 <- roc(response=train_C$risk_auc, predictor=train_C$syg_risk)
+ia_auc <- signif(auc(rocc4)[1],3)
+roc_dat <- data.frame(FPR=rev(1-rocc4$specificities),
+                      TPR=rev(rocc4$sensitivities))
+
+g4 <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 2, alpha = 0.7) +
+      labs(title= "IA12 ROC: C model",  x = "False Positive Rate",  
+           y = "True Positive Rate") +
+           annotate('text', x=0.75, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=font_size) +
+           annotate('text', x=0.75, y=y2, label=ia_auc, color="black", 
+                    fontface = 'bold', size=font_size) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme(plot.title = element_text(size = 12, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=15))
+
+grid.arrange(g2, g3, g4, nrow=2)
+
+##`r headerKable(tab1, title="sample sizes")`  
+```
+ 
+```{r allq}
+
+## get subjects based on quality
+ia12_subtype %>%
+  dplyr::mutate(quality="C") %>%
+  dplyr::mutate(quality=replace(quality, subtype %in% c("FGFR3", "t(4;14)"), "A")) %>%
+  dplyr::mutate(quality=replace(quality, subtype %in% c("amp1q", "del13", "del1p"), "B")) ->
+  ia12_subtype
+
+ia12_dt <- data.table(ia12_subtype)
+
+ia12_dt <- ia12_dt[, risk_mean:=mean(syg_risk), by=.(sample, quality)]
+
+q_km <- NULL
+
+## A quality
+ia12_dt %>%
+  dplyr::filter(quality =="A") %>%
+  dplyr::mutate(syg_risk=risk_mean) %>%
+  dplyr::select(-subtype, -syg_class) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(syg_class="low") %>%
+  dplyr::mutate(syg_class=replace(syg_class, syg_risk >= 0.5, "high")) %>%
+  dplyr::mutate(syg_class=replace(syg_class, syg_risk >= 0.6, "extreme")) ->
+  iaA 
+
+a_samps <- as.data.frame(table(iaA$syg_class)) 
+ 
+A_roc <- plotROC(iaA, title="IA12: A", doPlot=FALSE)
+roccy <- A_roc[[1]]
+roccy$quality <- "A"
+q_roc <- roccy[roccy$method=="SYGNAL",]
+q_auc <- A_roc[[2]][1,]
+
+iaA_tmp <- plotKM(iaA, title="IA12: A", doPlot=FALSE)
+survy <- iaA_tmp[[1]]
+survy <- survy[survy$method=="SYGNAL",]
+survy$quality <- "A"
+q_km <- rbind(q_km, survy)
+iaA_pfs_q <- iaA_tmp[[2]][1:3,]
+iaA_pfs_q$quality <- "A"
+iaA_pvals <- iaA_tmp[[3]]
+
+
+## B quality
+ia12_dt %>%
+  dplyr::filter(quality =="B") %>%
+  dplyr::mutate(syg_risk=risk_mean) %>%
+  dplyr::select(-subtype, -syg_class) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(syg_class="low") %>%
+  dplyr::mutate(syg_class=replace(syg_class, syg_risk >= 0.5, "high")) %>%
+  dplyr::mutate(syg_class=replace(syg_class, syg_risk >= 0.6, "extreme")) ->
+  iaB
+
+b_samps <- as.data.frame(table(iaB$syg_class)) 
+
+B_roc <- plotROC(iaB, title="IA12: B", doPlot=FALSE)
+roccy <- B_roc[[1]]
+roccy$quality <- "B"
+q_roc <- rbind(q_roc, roccy[roccy$method=="SYGNAL",])
+km_tmp <- B_roc[[2]][2,]
+km_tmp[1,1] <- B_roc[[2]][1,1]
+q_auc <- rbind(q_auc, km_tmp)
+
+iaB_tmp <- plotKM(iaB, title="IA12: B", doPlot=FALSE)
+survy <- iaB_tmp[[1]]
+survy <- survy[survy$method=="SYGNAL",]
+survy$quality <- "B"
+q_km <- rbind(q_km, survy)
+iaB_pfs_q <- iaB_tmp[[2]][1:3,]
+iaB_pfs_q$quality <- "B"
+iaB_pvals <- iaB_tmp[[3]]
+
+## C quality
+ia12_dt %>%
+  dplyr::filter(quality =="C") %>%
+  dplyr::mutate(syg_risk=risk_mean) %>%
+  dplyr::select(-subtype, -syg_class) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(syg_class="low") %>%
+  dplyr::mutate(syg_class=replace(syg_class, syg_risk >= 0.5, "high")) %>%
+  dplyr::mutate(syg_class=replace(syg_class, syg_risk >= 0.6, "extreme")) ->
+  iaC 
+
+c_samps <- as.data.frame(table(iaC$syg_class)) 
+
+C_roc <- plotROC(iaC, title="IA12: C", doPlot=FALSE)
+roccy <- C_roc[[1]]
+roccy$quality <- "C"
+q_roc <- rbind(q_roc, roccy[roccy$method=="SYGNAL",])
+km_tmp <- C_roc[[2]][3,]
+km_tmp[1,1] <- C_roc[[2]][1,1]
+q_auc <- rbind(q_auc, km_tmp)
+
+iaC_tmp <- plotKM(iaC, title="IA12: C", doPlot=FALSE)
+survy <- iaC_tmp[[1]]
+survy <- survy[survy$method=="SYGNAL",]
+survy$quality <- "C"
+q_km <- rbind(q_km, survy)
+iaC_pfs_q <- iaC_tmp[[2]][1:3,]
+iaC_pfs_q$quality <- "C"
+iaC_pvals <- iaC_tmp[[3]]
+
+if(FALSE) {
+  ax <- iaA$sample[iaA$syg_class=="extreme"]
+  bx <- iaB$sample[iaB$syg_class=="extreme"]
+  cx <- iaC$sample[iaC$syg_class=="extreme"]
+  library(venn)
+  venn(list(A=ax, B=bx, C=cx))
+}
+```
+  
+```{r q_plot}
+
+## ROC graph
+colnames(q_auc)[2:3] <- c("FPR", "TPR")
+q_auc$TPR <- c(0.32, 0.24, 0.16)
+q_auc$FPR <- 0.65
+q_auc$aucs <- apply(data.frame(c("A:", "B:", "C:"), q_auc$aucs), 1, paste, collapse=" ")
+q_auc$aucs <- apply(data.frame(q_auc$aucs, c(nrow(iaA), nrow(iaB), nrow(iaC))), 1, paste, collapse=" ")
+
+gg_q_roc <- ggplot(q_roc, aes(x=FPR, y=TPR)) + 
+  geom_line(aes(color=quality), size = 1, alpha = 0.7) +
+  scale_color_manual(values=q_auc$cols) +
+  theme_light() +
+  labs(x = "False Positive Rate", y = "True Positive Rate") +
+  guides(color = FALSE) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  theme(plot.title = element_text(size=12),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=12),
+    text = element_text(size=15),
+    axis.text.y= element_text(size=12, angle=0, hjust=1),
+    axis.text.x= element_text(size=12, angle=45, hjust=1),
+    axis.title = element_text(size=12)) +
+   theme(aspect.ratio = 1) +
+   annotate('text', x=0.65, y=0.4, label=" AUC   n", color="black", 
+                    fontface = 'bold', size=6) +
+  annotate('text', x=q_auc$FPR, y=q_auc$TPR, label=q_auc$aucs, 
+           color=q_auc$cols, size=6,  fontface = 'bold')
+print(gg_q_roc)
+ggsave(here("output/quality_ROC.pdf"))
+
+## KM plot 
+## get pvalues vs low risk group
+low_pvals <- cbind(iaA_tmp[[3]][,1:2], iaB_tmp[[3]][,2], iaC_tmp[[3]][,2])
+colnames(low_pvals) <- c("risk", "A", "B", "C")
+q_pvals <- data.frame(quality=c("A", "B", "C"), pvalues=c(iaA_tmp[[5]][1], iaB_tmp[[5]][1], iaC_tmp[[5]][1]))
+
+## combine med 50% PFS
+full_pfs <- rbind(iaA_pfs_q, iaB_pfs_q, iaC_pfs_q)
+full_pfs$y1 <- 0.5
+
+## format
+##q_km %<>%
+##  dplyr::mutate(risk=plyr::mapvalues(risk, from=c("extreme", "high", "low"),
+##                                     to=c("Extreme", "High", "Low")))
+##full_pfs %<>%
+##  dplyr::mutate(risk=plyr::mapvalues(risk, from=c("extreme", "high", "low"),
+##                                     to=c("Extreme", "High", "Low")))
+
+gg_q_km <- ggplot(q_km, aes(x=time, y=PFS)) +
+  geom_point(aes( color=risk), size=0.3, alpha=0.5) + 
+  geom_step(aes(color=risk), size=0.25) +
+  scale_color_manual(values=c("red", "green", "blue")) +
+  ##scale_shape_manual(values=shaps, breaks=c("extreme", "high", "low")) +
+  theme_light() +
+  guides(color="none") +
+  facet_wrap(~quality, nrow=1) +
+  theme(legend.justification=c(1,1), 
+        ##legend.position=c(1,1), 
+        legend.background=element_rect(fill="transparent"),
+        text = element_text(size=8),
+        legend.title=element_text(size=6), 
+        legend.text=element_text(size=6),
+        ##legend.spacing.y = unit(2, 'pt'),
+        ##legend.margin=unit(1, "mm")
+        axis.text= element_text(size=8, angle=0, hjust=1),
+        strip.background = element_rect(
+          color="black", fill="white", size=1, linetype="solid"),
+        strip.text = element_text(size = 6, color="black")
+        ##axis.text.y= element_text(size=14, angle=0, hjust=1)
+        ) +
+  xlab("PFS (months) actual outcome") + ylab("Survival probability") +
+  geom_hline(yintercept = 0.5, linetype="dotted") +
+  theme(aspect.ratio = 1) +
+  geom_segment(data=full_pfs, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2,
+                 color=risk), linetype="dotted", size=0.5) +
+  geom_text(data=q_pvals, mapping=aes(x=45, y=0.95, label=paste("p-value:", pvalues)),
+             inherit.aes = FALSE, size=2) 
+print(gg_q_km)
+ggsave(here("output/quality_KM.pdf"))
+
+gg_q_km <- ggplot(q_km, aes(x=time, y=PFS)) +
+  geom_point(aes( color=risk), size=0.3, alpha=0.5) + 
+  geom_line(aes(color=risk), size=0.25) +
+  scale_color_manual(values=c("red", "green", "blue")) +
+  ##scale_shape_manual(values=shaps, breaks=c("extreme", "high", "low")) +
+  theme_light() +
+  facet_wrap(~quality, nrow=1) +
+  theme(legend.justification=c(1,1), 
+        ##legend.position=c(1,1), 
+        legend.background=element_rect(fill="transparent"),
+        text = element_text(size=8),
+        legend.title=element_text(size=6), 
+        legend.text=element_text(size=6),
+        ##legend.spacing.y = unit(2, 'pt'),
+        ##legend.margin=unit(1, "mm")
+        axis.text= element_text(size=8, angle=0, hjust=1),
+        strip.background = element_rect(
+          color="black", fill="white", size=1, linetype="solid"),
+        strip.text = element_text(size = 6, color="black")
+        ##axis.text.y= element_text(size=14, angle=0, hjust=1)
+        ) +
+  xlab("PFS (months) actual outcome") + ylab("Survival probability") +
+  geom_hline(yintercept = 0.5, linetype="dotted") +
+  theme(aspect.ratio = 1) +
+  geom_segment(data=full_pfs, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2,
+                 color=risk), linetype="dotted", size=0.5) +
+  geom_text(data=q_pvals, mapping=aes(x=50, y=0.95, label=paste("p-value:", pvalues)),
+             inherit.aes = FALSE, size=2) +
+  labs(color="Risk")
+print(gg_q_km)
+ggsave(here("output/quality_KM_legend.pdf"))
+
+
+
+## get table of PFS
+pfs_out <- data.table::dcast(data.table(full_pfs[,c("pfs", "risk", "quality")]),
+                             formula=quality~risk, value.var="pfs")
+rownames(pfs_out) <- NULL
+
+## get table of risk sample sizes  
+all_samps <- rbind(a_samps$Freq, b_samps$Freq, c_samps$Freq)
+colnames(all_samps) <- c("extreme", "high", "low")
+
+## check extreme risk subjects
+ax <- iaA$sample[iaA$syg_class=="extreme"] 
+bx <- iaB$sample[iaB$syg_class=="extreme"] 
+cx <- iaC$sample[iaC$syg_class=="extreme"] 
+
+##intersect(bx, cx)
+
+man_tab <- cbind(pfs_out, all_samps)
+heady <- c("", "50% survival probability PFS"=3, "n"=3)
+```
+ 
+`r headerKable(pfs_out, title="50% survival probability PFS (months)")`  
+
+`r headerKable(man_tab) %>% add_header_above(heady)` 
+
+
+## Best quality model  
+
+```{r bg}
+
+## generate training data best model
+samps <- unique(ia12_dt$sample)
+qual_mod <- NULL
+for(samp in samps) {
+  ia12_dt %>%
+    dplyr::filter(sample==samp) %>%
+    dplyr::select(sample, risk_auc, quality, risk_mean, risk_auc) %>%
+    distinct() ->
+    tmp
+  outie <- NULL
+  if("A" %in% tmp$quality) {
+    outie <- tmp %>% dplyr::filter(tmp$quality=="A")
+  } else if("B" %in% tmp$quality) {
+    outie <- tmp %>% dplyr::filter(tmp$quality=="B")
+  } else {
+    outie <- tmp %>% dplyr::filter(tmp$quality=="C")
+  }
+  if(nrow(outie) > 1) {stop}
+  qual_mod <- rbind(qual_mod, outie)
+}
+syg_class <- data.frame(table(ia12_dt$syg_class))
+
+roccq <- roc(response=qual_mod$risk_auc, predictor=qual_mod$risk_mean)
+ia_auc <- signif(auc(roccq)[1],3)
+roc_dat <- data.frame(FPR=rev(1-roccq$specificities),
+                      TPR=rev(roccq$sensitivities))
+font_size <- 8
+
+gq <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 1, alpha = 0.7) +
+      labs(x = "False positive rate",  y = "True positive rate") +
+           annotate('text', x=0.75, y=0.35, label="AUC", color="black", 
+                    fontface = 'bold', size=font_size) +
+           annotate('text', x=0.75, y=y2, label=ia_auc, color="black", 
+                    fontface = 'bold', size=font_size) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme_light() +
+  theme(legend.title=element_text(size=10), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=8)) +
+  theme(aspect.ratio=4/4)
+print(gq)
+ggsave(here("output/bestquality_ROC_training.pdf"))
+
+
+
+
+
+syg_class <- data.frame(table(ia12_pheno$syg_class))
+
+roccq <- roc(response=ia12_pheno$risk_auc, predictor=ia12_pheno$syg_risk)
+ia_auc <- signif(auc(roccq)[1],3)
+roc_dat <- data.frame(FPR=rev(1-roccq$specificities),
+                      TPR=rev(roccq$sensitivities))
+font_size <- 12
+
+gq <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 2, alpha = 0.7) +
+      labs(x = "False positive rate",  y = "True positive rate") +
+           annotate('text', x=0.75, y=0.35, label="AUC", color="black", 
+                    fontface = 'bold', size=font_size) +
+           annotate('text', x=0.75, y=y2, label=ia_auc, color="black", 
+                    fontface = 'bold', size=font_size) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme_light() +
+  theme(legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=20)) +
+  theme(aspect.ratio=3/4)
+print(gq)
+ggsave(here("output/bestquality_ROC.pdf"))
+
+## KM plot
+cox_ia <- survfit(Surv(time=PFS, event=D_PFS_FLAG)~ syg_class, data=ia12_pheno)
+
+## get log-rank test p-value
+lr_syg <- survdiff(Surv(time=PFS, event=D_PFS_FLAG)~ syg_class, data=ia12_pheno)
+syg_pval1 <- signif(broom::glance(lr_syg)$p.value, 3)
+
+## generate plot
+labs <- names(cox_ia$strata)
+labs <- str_remove(labs, "syg_class=")
+tab <- cox_ia$strata
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2]), rep(labs[3], tab[3])))
+
+surv_df <- data.frame(SYGNAL_risk=plot_ind, 
+                      PFS=cox_ia$surv, 
+                      time=cox_ia$time)
+
+## get med PFS (50% survival)
+med_pfs <- summary(cox_ia)$table[,7]
+names(med_pfs) <- labs
+pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      SYGNAL_risk=names(med_pfs))
+
+## collect for full set of plots
+surv_pap <- surv_df
+surv_pap$method <- "mmSYGNAL"
+pfs_pap <- pfs_tab
+pfs_pap$method="mmSYGNAL"
+
+km1a <- ggplot(surv_df, aes(x=time, y=PFS, color=SYGNAL_risk)) + geom_point() + geom_step() +
+    scale_color_manual(values=c("red", "green", "blue")) +
+    theme_light() +
+    theme(legend.justification=c(1,1), legend.position=c(1,1),
+          legend.background=element_rect(fill="transparent")) + 
+    xlab("PFS (months)") + ylab("Survival probability") +
+    geom_hline(yintercept = 0.5, linetype="dotted") +
+    geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") + labs(color="risk") + 
+    annotate("text", x=30, y=0.99, label=paste("log-rank p-value:", syg_pval1), size=6) +
+    theme(legend.title=element_text(size=12), 
+    legend.text=element_text(size=12)) +
+    theme(text = element_text(size=20)) +
+    theme(aspect.ratio=3/4)
+ 
+print(km1a)
+ggsave(here("output/bestquality_KM.pdf"), device="pdf")
+
+```
+
+```{r multiplot}
+library(ggpubr)
+
+ggarrange(gg_q_km,  
+          ggarrange(gg_sub, gg_q_roc, ncol = 2, labels = c("B", "C")), 
+          nrow = 2, 
+          labels = "A"    
+          ) 
+```
+
+## **GSE19784**  {.tabset .tabset-pills}   
+   
+### **Scatter plots by subtype**  
+
+```{r mm_scatter_gse1}
+gse1_syg_dt <- data.table::melt(data.table(gse1_pheno), 
+                            id.vars=c("sample", "PFS", "GuanScore", "risk"),
+                            measure.vars=c("syg_risk", "sky92", "gep70"))
+
+mm_cors_guan <- gse1_syg_dt[,cor(GuanScore, value), by=.(variable)]
+colnames(mm_cors_guan) <- c("method", "correlation")
+mm_cors_guan$method <- c("mmSYGNAL", "SKY92", "GEP70")
+
+mm_cors_pfs <- gse1_syg_dt[,cor(PFS, value), by=.(variable)]
+colnames(mm_cors_pfs) <- c("method", "correlation")
+mm_cors_pfs$method <- c("mmSYGNAL", "SKY92", "GEP70")
+
+ggplot(gse1_syg_dt, aes(x=PFS, y=value)) + 
+  geom_point(aes(color=risk), size=0.25) +
+  ggtitle("GuanScore") + 
+  geom_smooth(method="lm") +
+  facet_wrap(~variable, scale="free") +
+  theme(aspect.ratio=1)
+ggsave(here("output/gse1_PFS_scatter.pdf"))
+
+ggplot(gse1_syg_dt, aes(x=GuanScore, y=value)) + 
+  geom_point(aes(color=risk), size=0.25) +
+  ggtitle("GuanScore") + 
+  geom_smooth(method="lm") +
+  facet_wrap(~variable, ncol=3, scale="free") +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank()) +
+  theme(aspect.ratio=1)
+ggsave(here("output/gse1_Guan_scatter.pdf"))
+
+```
+  
+`r headerKable(mm_cors_guan, title="GSE19784 Guan cors")`  
+  
+`r headerKable(mm_cors_pfs, title="GSE19784 PFS cors")`  
+   
+   
+### **Full model: all subjects**  
+  
+Full model ROC (first plot) uses all subjects with SYGNAL using the best quality model.  
+  
+```{r gse1_roc_full, eval=TRUE}
+gse1_tmp <- plotROC(gse1_pheno, titley="GSE19784")
+gse1_roc <- gse1_tmp[[1]]
+gse1_auc <- gse1_tmp[[2]]
+gse1_roc$data <- "GSE19784"
+gse1_gg <- gse1_tmp[[3]]
+```
+   
+```{r gse1_km1, eval=TRUE}
+gse1_tmp <- plotKM(gse1_pheno, titley="GSE19784")
+gse1_surv <- gse1_tmp[[1]]
+gse1_surv$data <- "GSE19784"
+gse1_pfs <- gse1_tmp[[2]]
+gse1_pvals <- gse1_tmp[[3]]
+gse1_km <- gse1_tmp[[4]]
+
+gse1_tab <- data.table::dcast(data.table(gse1_pfs[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+```
+  
+`r headerKable(gse1_tab, title="Med PFS 50% (months)")`    
+  
+`r headerKable(gse1_pvals, title="logrank FDR values", digitts=3)`  
+   
+### **t(4;14)**
+
+t(4;14) ROC curve only shows the risk prediction for subjects exhibiting the t(4;14) subtype.
+  
+```{r gse1_roc_t, eval=TRUE}
+gse1_pheno %>%
+  dplyr::filter(WHSC1==1) ->
+  gse1_t
+
+gse1_roc_t <- plotROC(gse1_t, titley="GSE19784: t(4;14)")
+gse1_t414_roc <- gse1_roc_t[[1]]
+gse1_t414_roc$subtype <- "t(4;14)"
+gse1_t414_auc <- gse1_roc_t[[2]]
+gse1_t414_roc$data <- "GSE19784"
+```   
+   
+```{r gse1_km1_t, eval=TRUE}
+gse1_tmp <- plotKM(gse1_t, titley="GSE19784: t(4;14)")
+gse1_surv_t <- gse1_tmp[[1]]
+gse1_surv_t$data <- "GSE19784"
+gse1_surv_t$subtype <- "t(4;14)"
+gse1_pfs_t <- gse1_tmp[[2]]
+gse1_pfs_t$subtype <- "t(4;14)"
+gse1_pfs_t$data <- "GSE24080"
+gse1_pvals_t <- gse1_tmp[[3]]
+
+gse1_tab_t <- data.table::dcast(data.table(gse1_pfs_t[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+```
+  
+`r headerKable(gse1_tab_t, title="Med PFS 50% (months)")`    
+  
+`r headerKable(gse1_pvals, title="logrank FDR values", digitts=3)`
+   
+## **GSE24080**  {.tabset .tabset-pills}   
+  
+### **Scatter plots by subtype**  
+
+```{r mm_scatter_gse2}
+gse2_syg_dt <- data.table::melt(data.table(gse2_pheno), 
+                            id.vars=c("sample", "PFS", "GuanScore", "risk"),
+                            measure.vars=c("syg_risk", "sky92", "gep70"))
+
+mm_cors_guan <- gse2_syg_dt[,cor(GuanScore, value), by=.(variable)]
+colnames(mm_cors_guan) <- c("method", "correlation")
+mm_cors_guan$method <- c("mmSYGNAL", "SKY92", "GEP70")
+
+mm_cors_pfs <- gse2_syg_dt[,cor(PFS, value), by=.(variable)]
+colnames(mm_cors_pfs) <- c("method", "correlation")
+mm_cors_pfs$method <- c("mmSYGNAL", "SKY92", "GEP70")
+
+ggplot(gse2_syg_dt, aes(x=PFS, y=value)) + 
+  geom_point(aes(color=risk), size=0.25) +
+  ggtitle("PFSm") + 
+  geom_smooth(method="lm") +
+  facet_wrap(~variable, ncol=3, scale="free") +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank()) +
+  theme(aspect.ratio=1)
+ggsave(here("output/gse2_PFS_scatter.pdf"))
+
+ggplot(gse2_syg_dt, aes(x=GuanScore, y=value)) + 
+  geom_point(aes(color=risk), size=0.25) +
+  ggtitle("GuanScore") + 
+  geom_smooth(method="lm") +
+  facet_wrap(~variable, ncol=3, scale="free") +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank()) +
+  theme(aspect.ratio=1)
+ggsave(here("output/gse2_Guan_scatter.pdf"))
+
+```
+  
+`r headerKable(mm_cors_guan, title="GSE24080 Guan cors")`  
+  
+`r headerKable(mm_cors_pfs, title="GSE24080 PFS cors")`  
+     
+     
+## Compare Guan to survival clinical outcome
+
+```{r guan_surv}
+
+mm_risk$surv_risk <- ifelse(mm_risk$PFS <= 36 & mm_risk$relapse=="yes", 1, 0)
+
+survy <- table(mm_risk$surv_risk)
+guany <- table(mm_risk$risk)
+
+
+mm_risk %>%
+  dplyr::group_by(risk) %>%
+  summarize(maxi= max(PFS), mini=min(PFS)) ->
+  risk_pfs_sums
+```
+     
+## Risk stratification by genetic abnormality subtype counts
+  
+Risk stratification by genetic abnormality subtype was done by first calculating the number of high risk subtypes (del(17p), 1q+, FGFR3, WHSC1 and MAF) each subject showed. All subjects were then ranked by number of subtypes (0 to 6). For each subtype count category, subjects were randomly ordered.  
+  
+Rank ordering within each subtype count category was based on SYGNAL risk probability for the stratification that combined SYGNAL risk probability and subtype stratification.   
+   
+```{r sub_strat, eval=TRUE}
+
+set.seed(123)
+
+## sort subjects by number of high-risk subtypes
+## first randomly order all subjects 
+sub_strat <- mm_risk[sample(nrow(mm_risk), nrow(mm_risk)),] 
+
+## count counts of mutations, excluding t(11;14), CCND1
+sub_strat %>%
+  dplyr::select(del17p, amp1q, FGFR3, WHSC1, MAF) %>%
+  rowSums() ->
+  mut_counts
+
+count_tab <- map_df(as.data.frame(table(mut_counts)), rev)
+colnames(count_tab) <- c("mutations", "counts")
+
+sub_strat$sub_mut_counts <- mut_counts
+sub_strat$sub_mut_counts1 <- mut_counts
+                                   
+sub_strat$subtype_risk <- ifelse(sub_strat$sub_mut_counts==0, 0, 1)
+sub_strat$subtype_risk1 <- sub_strat$subtype_risk
+
+## now reorder by number of mutations (stratifying by genomic subbtype)
+sub_strat %<>% dplyr::arrange(sub_mut_counts)
+
+## join with sygnal risk
+sub_strat %>%
+  dplyr::select(sample, PFS, relapse, GuanScore, sub_mut_counts, sub_mut_counts1, subtype_risk,
+                extreme_risk, subtype_risk1) %>%
+  dplyr::left_join(train_preds, by=c("sample"="subject")) ->
+  sub_risk
+
+## subtype roc
+sub_roc_res <-  roc(response=sub_risk$risk_auc, predictor=sub_risk$sub_mut_counts)
+aucs <- signif(auc(sub_roc_res)[1],3)
+roc_dat <- data.frame(FPR=rev(1-sub_roc_res$specificities),
+                      TPR=rev(sub_roc_res$sensitivities),
+                      type="cytogenetics")
+
+## sygnal roc
+syg_roc_res <-  roc(response=sub_risk$risk_auc, predictor=sub_risk$syg_risk)
+aucs <- c(aucs, signif(auc(syg_roc_res)[1],3))
+roc_dat <- rbind(roc_dat, data.frame(FPR=rev(1-syg_roc_res$specificities),
+                      TPR=rev(syg_roc_res$sensitivities),
+                      type="mmSYGNAL"))
+
+## sygnal + subtype roc
+sub_risk %>%
+  dplyr::arrange(sub_mut_counts, syg_risk) %>%
+  mutate(both=1:nrow(sub_risk)) ->
+  both_risk
+both_roc_res <-  roc(response=both_risk$risk_auc, predictor=both_risk$both)
+aucs <- c(aucs, signif(auc(both_roc_res)[1],3))
+roc_dat <- rbind(roc_dat, data.frame(FPR=rev(1-both_roc_res$specificities),
+                      TPR=rev(both_roc_res$sensitivities),
+                      type="both"))
+```
+
+```{r cyto_roc_all}   
+
+font_size <- 5
+title_size <- 15
+
+  ggplot(roc_dat, aes(FPR, TPR, color=type)) + 
+   geom_line(size = 1, alpha = 0.7) +
+   scale_color_manual(values=c("red", "green", "blue")) +
+   theme_light() +
+   theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 16),
+        axis.title = element_text(size = 16),
+        legend.text=element_text(size=15),
+        legend.title=element_text(size=15)) +
+      labs(x = "FPR", y = "TPR") +
+           annotate('text', x=0.7, y=0.35, label="AUC", color="black", 
+                    fontface = 'bold', size=font_size) +
+           annotate('text', x=0.7, y=0.28, label=paste("mmSYGNAL:", aucs[2]), color="blue", 
+                    fontface = 'bold', size=font_size) +
+           annotate('text', x=0.7, y=0.14, label=paste("both:              ", aucs[3]), color="red", 
+                    fontface = 'bold', size=font_size) +
+           annotate('text', x=0.7, y=0.21, label=paste("cytogenetics:  ", aucs[1]), color="green", 
+                    fontface = 'bold', size=font_size) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") +
+   guides(color="none") + theme(aspect=c(4/4))
+  
+ ggsave(here("output/cyto_roc.pdf"), dev="pdf")
+```
+
+### Cytogenetics: change risk distribution  
+
+```{r samps}
+
+getSamps <- function(count, mat=sub_strat, doBi=FALSE) {
+    
+  if(doBi) {
+     mat %>%
+       dplyr::filter(sub_mut_counts>count) ->
+       tmp
+  } else {
+    mat %>%
+       dplyr::filter(sub_mut_counts==count) ->
+       tmp
+  }
+    total <- nrow(tmp)
+    high <- sum(tmp$risk_auc==1)
+    low <- sum(tmp$risk_auc==0)
+    return(c(total=as.character(total), high=paste0(round(high/total, 2)*100, "%"),
+             low=paste0(round(low/total, 2)*100, "%") ) )
+}
+
+res <- t(sapply(0:4, getSamps))
+res1 <- getSamps(0, doBi=TRUE)
+
+res_both <- rbind(res[1,], res1, res[2:5,])
+outie <- data.frame("cyto counts"=c(0, ">0", 1:4), res_both)
+row.names(outie) <- NULL
+colnames(outie)[1] <- "cyto count"
+```
+  
+`r headerKable(outie, title="IA12 cytogenetics")`  
+  
+
+
+```{r cyto_change}
+
+## remove this number of low risk samples who exhibit high risk subtype to make proportion match
+## scca. (189-x)/(313-x) = 0.36
+x <- 120
+
+## get index of patients with high cyto risk and low risk clinical outcome
+low_cyto <- which(sub_strat$sub_mut_counts >= 1 & sub_strat$risk_auc == 0)
+removals <- sample(low_cyto, x)
+
+new_strat <- sub_strat[-removals,]
+res1 <- getSamps(0, mat=new_strat, doBi=TRUE)
+
+## subtype roc
+sub_roc_res <-  roc(response=new_strat$risk_auc, predictor=new_strat$sub_mut_counts)
+aucs_c1 <- signif(auc(sub_roc_res)[1],3)
+
+aucs <- c(aucs, signif(auc(sub_roc_res)[1],3))
+roc_dat <- rbind(roc_dat, data.frame(FPR=rev(1-sub_roc_res$specificities),
+                      TPR=rev(sub_roc_res$sensitivities),
+                      type="cyto_mod"))
+
+```
+   
+```{r cyto_roc_mod}   
+
+font_size <- 5
+title_size <- 15
+
+## extract two cytogenetic methods
+roc_dat %>%
+  dplyr::filter(type=="cytogenetics" | type=="cyto_mod") ->
+  roc_cyto
+
+  ggplot(roc_cyto, aes(FPR, TPR, color=type)) + 
+   geom_line(size = 1, alpha = 0.7) +
+   scale_color_manual(values=c("purple", "green")) +
+   theme_classic() +
+   theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 16),
+        axis.title = element_text(size = 16),
+        legend.text=element_text(size=15),
+        legend.title=element_text(size=15)) +
+      labs(x = "FPR", y = "TPR") +
+           annotate('text', x=0.7, y=0.35, label="AUC", color="black", 
+                    fontface = 'bold', size=font_size) +
+           annotate('text', x=0.7, y=0.28, label=paste("cytogenetics:  ", aucs[1]), color="green", 
+                    fontface = 'bold', size=font_size) +
+     annotate('text', x=0.7, y=0.21, label=paste("cyto mod:       ", aucs[4]), color="purple", 
+                    fontface = 'bold', size=font_size) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") +
+   guides(color="none") + theme(aspect=c(4/4))
+  
+ ggsave(here("output/cyto_roc_mod.pdf"), dev="pdf")
+```
+  
+`r headerKable(count_tab, title="Sample sizes of number of mutations")`  
+  
+  
+### KM survival plots  
+  
+#### Risk stratification by subtype abnormality counts
+  
+del(13) and MAF subtypes are not included in subtype abnormality counts.
+   
+```{r km}
+
+plot_risk <- sub_risk
+
+## calculate percent correct calls for Anoop Patel
+plot_risk$syg_class <- ifelse(plot_risk$syg_risk >=0.5, "high", "low")
+plot_risk$syg_classx <- ifelse(plot_risk$syg_risk >= 0.6, 
+                               "extreme", plot_risk$syg_class)
+clin_risk <- table(plot_risk$extreme_risk)
+
+## cytogenetics
+tabby <- table(plot_risk[, c("extreme_risk", "sub_mut_counts")])
+tabby_2 <- table(plot_risk[, c("risk_auc", "sub_mut_counts")])
+cyto_low <- tabby[1,5]/clin_risk[1]
+cyto_high <- sum(tabby_2[2, -c(5)])/clin_risk[2]
+cyto_right <- (tabby[1,5] + sum(tabby[2, -c(5)]))/sum(clin_risk)
+
+## mmSYGNAL
+tabby2 <- table(plot_risk[, c("extreme_risk", "syg_classx")])
+tabby_2 <- table(plot_risk[, c("risk_auc", "syg_class")])
+syg_low <- tabby2[1,2]/clin_risk[1]
+syg_high <- sum(tabby2[2,1])/clin_risk[2]
+syg_right <- (tabby2[1,2] + tabby2[2,1])/sum(clin_risk)
+
+plot_risk$sub_mut_counts <- factor(plot_risk$sub_mut_counts, 
+                                   levels=sort(unique(plot_risk$sub_mut_counts),
+                                               decreasing=TRUE),
+                                    ordered=TRUE)
+plot_risk$PFS_event <- ifelse(plot_risk$relapse=="yes", 1, 0)
+
+sub_surv <- survfit(Surv(time=PFS, event=PFS_event)~ sub_mut_counts, data=plot_risk)
+labs <- names(sub_surv$strata)
+labs <- str_remove(labs, "sub_mut_counts=")
+tab <- sub_surv$strata
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2]), rep(labs[3], tab[3]), rep(labs[4], tab[4]), rep(labs[5], tab[5])))
+
+surv_df <- data.frame(abnormalities=plot_ind, 
+                      PFS=sub_surv$surv, 
+                      time=sub_surv$time)
+
+surv_50 <- summary(sub_surv)$table[,c(1,7)]
+surv_50 <- cbind(abnormalities=4:0, surv_50)
+colnames(surv_50) <- c("abnormalities", "n", "50% PFS")
+rownames(surv_50) <- NULL
+surv_50 <- surv_50[,c(1,3,2)]
+
+## get med PFS (50% survival)
+med_pfs <- summary(sub_surv)$table[,7]  
+names(med_pfs) <- labs
+pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      abnormalities=names(med_pfs))
+
+## extract default ggplot2 colors
+hex_cols <- rev(hue_pal()(6))      
+
+ggplot(surv_df, aes(x=time, y=PFS, color=abnormalities)) + geom_point() +
+   geom_step() +
+    scale_color_manual(values=hex_cols[-6]) +
+    theme_light() +
+    theme(legend.justification=c(1,1), legend.position=c(1,1),
+          legend.background=element_rect(fill="transparent"),
+          text = element_text(size=16)) + 
+    xlab("PFS (months)") + ylab("survival probability") +
+    ##ggtitle(paste("cytogenetic count KM")) +
+    geom_hline(yintercept = 0.5, linetype="dotted") +
+    geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") + labs(color="count") +
+   annotate('text', x=pfs_tab$pfs, y=-.05, label=pfs_tab$abnormalities, color=rev(hex_cols[-6]), fontface = 'bold', size=font_size) +
+  theme(aspect=4/4)
+ ggsave(here("output/cyto_KM.pdf"), dev="pdf")
+
+## calculate log rank statistics for differences between no abnormalities 
+getRiskPval <- function(dat, count=1) {
+  dat %>%
+  dplyr::filter(sub_mut_counts == 0 | sub_mut_counts == count) %>%
+  dplyr::mutate(sub_mut_counts=factor(sub_mut_counts)) ->
+  dat
+  test <- survdiff(Surv(time=PFS, event=PFS_event)~ sub_mut_counts, data=dat)
+  pval <- broom::glance(test)$p.value
+  coxx <- summary(coxph(Surv(time=PFS, event=PFS_event)~ sub_mut_counts, 
+                        data=dat))$coefficients[c(2,5)]
+  return(c(p=pval, HR=coxx[1], p=coxx[2]))
+}
+
+plot_risk$mut <- ifelse(plot_risk$sub_mut_counts==0, 0, 1)
+test_0 <- survdiff( Surv(time=PFS, event=PFS_event)~ mut, data=plot_risk)
+p_0 <- broom::glance(test_0)$p.value
+cox_0 <- summary(coxph( Surv(time=PFS, event=PFS_event)~ mut,
+                        data=plot_risk))$coefficients[c(2,5)]
+
+res_1 <- getRiskPval(plot_risk, count=1)
+res_2 <- getRiskPval(plot_risk, count=2)
+res_3 <- getRiskPval(plot_risk, count=3)
+res_4 <- getRiskPval(plot_risk, count=4)
+
+res_all <- data.frame(rbind(res_1, res_2, res_3, res_4, c(p_0, cox_0)))
+res_all <- cbind(count=c(1:4, "0 v 1+"), res_all)
+rownames(res_all) <- NULL
+colnames(res_all)[4] <- "p"
+
+```
+  
+Table of log rank test for difference of survival curves for subjects with 0 abnormalities vs those with 1 to 5 abnormalities.
+
+`r headerKable(res_all[,1:2], title="log rank p-values", digitts=3)`
+
+`r headerKable(surv_50, title="50% survival probability PFS (months)", digitts=3)`
+    
+#### KM plots cyto vs mmSYGNAL  
+
+```{r km_cyto_mm}
+
+## cytogenetics high/low risk
+sub_surv <- survfit(Surv(time=PFS, event=PFS_event)~ mut, data=plot_risk)
+labs <- names(sub_surv$strata)
+labs <- str_remove(labs, "mut=")
+labs <- plyr::mapvalues(labs, from=c("0", "1"), to=c("low", "high"))
+tab <- sub_surv$strata
+
+## get log-rank test p-value
+lr_cyto <- survdiff(Surv(time=PFS, event=PFS_event)~ mut, data=plot_risk)
+cyto_pval <- signif(broom::glance(lr_cyto)$p.value, 3)
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2])))
+
+surv_df <- data.frame(abnormalities=plot_ind, 
+                      PFS=sub_surv$surv, 
+                      time=sub_surv$time,
+                      method="cytogenetics")
+
+## get med PFS (50% survival)
+med_pfs <- summary(sub_surv)$table[,7]  
+names(med_pfs) <- labs
+pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      abnormalities=names(med_pfs),
+                      colors=c("blue", "green"),
+                      method="cytogenetics")
+
+## cytogenetics extreme/high/low risk
+plot_risk %<>% 
+  dplyr::mutate(mut_extreme=plyr::mapvalues(sub_mut_counts, from=c(0,1,2,3,4),
+                                            to=c("low", "high", rep("extreme", 3))))  
+
+sub_surv <- survfit(Surv(time=PFS, event=PFS_event)~ mut_extreme, data=plot_risk)
+labs <- names(sub_surv$strata)
+labs <- str_remove(labs, "mut_extreme=")
+tab <- sub_surv$strata
+
+## get log-rank test p-value
+lr_cyto1 <- survdiff(Surv(time=PFS, event=PFS_event)~ mut_extreme, data=plot_risk)
+cyto1_pval <- signif(broom::glance(lr_cyto1)$p.value, 3)
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2]),  rep(labs[3], tab[3])))
+
+surv_df1 <- data.frame(abnormalities=plot_ind, 
+                      PFS=sub_surv$surv, 
+                      time=sub_surv$time,
+                      method="cytogenetics")
+
+## get med PFS (50% survival)
+med_pfs <- summary(sub_surv)$table[,7]  
+names(med_pfs) <- labs
+pfs_tab1 <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      abnormalities=names(med_pfs),
+                      colors=c("red", "green", "blue"),
+                      method="cytogenetics")
+
+## mmSYGNAL 
+plot_risk %>%
+  dplyr::mutate(syg_class=ifelse(syg_risk < 0.5, "low", "high")) %>%
+  dplyr::mutate(syg_class=ifelse(syg_risk >=0.6, "extreme", syg_class)) ->
+  plot_risk
+
+sub_surv <- survfit(Surv(time=PFS, event=PFS_event)~ syg_class, data=plot_risk)
+labs <- names(sub_surv$strata)
+labs <- str_remove(labs, "syg_class=")
+tab <- sub_surv$strata
+
+## get log-rank test p-value
+lr_syg <- survdiff(Surv(time=PFS, event=PFS_event)~ extreme_risk, data=plot_risk)
+syg_pval <- signif(broom::glance(lr_syg)$p.value, 3)
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2]), rep(labs[3], tab[3])))
+
+surv_df2 <- data.frame(abnormalities=plot_ind, 
+                      PFS=sub_surv$surv, 
+                      time=sub_surv$time,
+                      method="mmSYGNAL")
+
+## get med PFS (50% survival)
+med_pfs <- summary(sub_surv)$table[,7]  
+names(med_pfs) <- labs
+pfs_tab2 <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      abnormalities=names(med_pfs),
+                      colors=c("red", "green", "blue"),
+                      method="mmSYGNAL")
+
+## plot KM with 2 risk groups
+surv_all <- rbind(surv_df, surv_df2) 
+pfs_all <- rbind(pfs_tab, pfs_tab2)
+pval_all <- data.frame(method=c("mmSYGNAL", "cytogenetics"), pvalue=c(syg_pval, cyto_pval))
+
+ ggplot(surv_all, aes(x=time, y=PFS, color=abnormalities)) + 
+   geom_step() + geom_point() +
+   scale_color_manual(values=c("low"="blue", "high"="green", "extreme"="red")) +
+   facet_wrap(~method, nrow=1) +
+  ##facet_grid(.~fct_relevel(method, levels=c("mmSYGNAL", "cytogenetics")), scales="fixed") +
+  ylab("survival probability") + xlab("PFS months") +
+    guides(color="none") +
+   ##theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+   theme(aspect.ratio=1:1) +
+   theme(axis.text = element_text(size = 8)) +
+    geom_segment(data=pfs_all, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") +
+   geom_hline(yintercept = 0.5, linetype="dotted") +
+   geom_text(data=pval_all, mapping=aes(x=50, y=0.9, label=paste("p-value:", pvalue)),
+             inherit.aes = FALSE, size=3)
+
+ggsave(here("output/man_ia12_cyto2_km.pdf"), device="pdf")
+ 
+
+## plot KM with 3 risk groups
+surv_all <- rbind(surv_df1, surv_df2) 
+pfs_all <- rbind(pfs_tab1, pfs_tab2)
+pval_all <- data.frame(method=c("mmSYGNAL", "cytogenetics"), pvalue=c(syg_pval, cyto1_pval))
+
+ ggplot(surv_all, aes(x=time, y=PFS, color=abnormalities)) + 
+   geom_step() + geom_point() +
+   theme_light() +
+   scale_color_manual(values=c("low"="blue", "high"="green", "extreme"="red")) +
+    facet_wrap(~method, nrow=1) +
+  ##facet_grid(.~fct_relevel(method, levels=c("mmSYGNAL", "cytogenetics")), scales="fixed") +
+  ylab("survival probability") + xlab("PFS months") +
+    guides(color="none") +
+   ##theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+   theme(aspect.ratio=1:1) +
+   theme(axis.text = element_text(size = 8),
+          strip.background = element_rect(color="black", fill="white", size=1, linetype="solid"),
+    strip.text = element_text(size = 10, color="black")) +
+    geom_segment(data=pfs_all, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") +
+   geom_hline(yintercept = 0.5, linetype="dotted") +
+   geom_text(data=pval_all, mapping=aes(x=50, y=0.9, label=paste("p-value:", pvalue)),
+             inherit.aes = FALSE, size=4)
+
+ggsave(here("output/man_ia12_cyto3_km.pdf"), device="pdf")
+```
+  
+### **Full model: all subjects**  
+  
+Full model ROC (first plot) uses all subjects with SYGNAL using the best quality model.  
+  
+```{r gse2_roc_full, eval=TRUE}
+gse2_tmp <- plotROC(gse2_pheno, titley="GSE24080")
+gse2_roc <- gse2_tmp[[1]]
+gse2_auc <- gse2_tmp[[2]]
+gse2_roc$data <- "GSE24080"
+gse2_gg <- gse2_tmp[[3]]
+```
+   
+
+```{r gse2_km1, eval=TRUE}
+gse2_tmp <- plotKM(gse2_pheno,titley="GSE19784")
+gse2_surv <- gse2_tmp[[1]]
+gse2_surv$data <- "GSE24080"
+gse2_pfs <- gse2_tmp[[2]]
+gse2_pvals <- gse2_tmp[[3]]
+gse2_km <- gse2_tmp[[4]]
+
+gse2_tab <- data.table::dcast(data.table(gse2_pfs[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+```
+    
+`r headerKable(gse2_tab, title="50% survival probability PFS (months)")`    
+  
+`r headerKable(gse2_pvals, title="logrank FDR values", digitts=3)`
+   
+### **t(4;14)**
+
+t(4;14) ROC curve only shows the risk prediction for subjects exhibiting the t(4;14) subtype.
+  
+```{r gse2_roc_t, eval=TRUE}
+gse2_pheno %>%
+  dplyr::filter(WHSC1==1) ->
+  gse2_t
+
+gse2_tmp <- plotROC(gse2_t, titley="GSE24080: t(4;14)")
+gse2_t414_roc <- gse2_tmp[[1]]
+gse2_t414_roc$subtype <- "t(4;14)"
+gse2_t414_auc <- gse2_tmp[[2]]
+gse2_t414_roc$data <- "GSE24080"
+```   
+
+```{r gse2_km1_t, eval=TRUE}
+gse2_tmp <- plotKM(gse2_t, titley="GSE24080: t(4;14)")
+gse2_surv_t <- gse2_tmp[[1]]
+gse2_surv_t$data <- "GSE24080"
+gse2_surv_t$subtype <- "t(4;14)"
+gse2_pfs_t <- gse2_tmp[[2]]
+gse2_pfs_t$subtype <- "t(4;14)"
+gse2_pfs_t$data <- "GSE24080"
+gse2_pvals <- gse2_tmp[[3]]
+
+gse2_tab_t <- data.table::dcast(data.table(gse2_pfs_t[,c("pfs", "methods", "risk")]),
+                            formula=methods~risk, value.var="pfs")
+```
+  
+`r headerKable(gse2_tab_t, title="50% survival probability PFS (months)")`    
+  
+`r headerKable(gse2_pvals, title="logrank FDR values", digitts=3)`
+ 
+  
+# Full plots    
+
+## ROC {.tabset .tabset-pills} 
+  
+### Highest quality model  
+  
+```{r full_roc}
+
+## get ISS ROC curve info
+## IA12
+ia12_ISS <- read_csv(here("data/ia12_pheno_01012023.csv"))
+ia12_ISS$ISS_auc <- plyr::mapvalues(ia12_ISS$ISS, from=c(1,2,3), to=c(3,2,1))
+rocc <- roc(response=ia12_ISS$risk_auc, predictor=ia12_ISS$ISS_auc, plot=TRUE,
+            direction=">")
+iss_ia12_auc <- signif(auc(rocc)[1],3)
+
+iss1 <- data.frame(FPR=rev(1-rocc$specificities),
+                   TPR=rev(rocc$sensitivities),
+                   method="ISS", data="IA12") 
+
+## GSE19784
+gse1_ISS <- read_csv(here("data/validation/GSE19784_pheno_01012023.csv"))
+gse1_ISS$ISS_auc <- plyr::mapvalues(gse1_ISS$ISS, from=c(1,2,3), to=c(3,2,1))
+rocc <- roc(response=gse1_ISS$risk_auc, predictor=gse1_ISS$ISS_auc, plot=TRUE,
+            direction=">")
+iss_gse1_auc <- signif(auc(rocc)[1],3)
+
+iss2 <- data.frame(FPR=rev(1-rocc$specificities),
+                   TPR=rev(rocc$sensitivities),
+                   method="ISS", data="GSE19784") 
+
+## GSE24080
+gse2_ISS <- read_csv(here("data/validation/GSE24080_pheno_01012023.csv"))
+gse2_ISS$ISS_auc <- plyr::mapvalues(gse2_ISS$ISS, from=c(1,2,3), to=c(3,2,1))
+rocc <- roc(response=gse2_ISS$risk_auc, predictor=gse2_ISS$ISS_auc, plot=TRUE,
+            direction=">")
+iss_gse2_auc <- signif(auc(rocc)[1],3)
+
+iss3 <- data.frame(FPR=rev(1-rocc$specificities),
+                   TPR=rev(rocc$sensitivities),
+                   method="ISS", data="GSE24080") 
+
+
+dat <- rbind(ia12_roc, gse1_roc, gse2_roc, iss1, iss2, iss3)
+dat$data <- factor(dat$data, levels=c("IA12", "GSE19784", "GSE24080"),
+                   ordered=TRUE)
+
+## add sample size 
+new_labs <- apply(data.frame(data=c("IA12", "GSE19784", "GSE24080"),
+                             n=c(nrow(mm_risk), nrow(gse1_pheno), nrow(gse2_pheno))), 1,
+                             paste, collapse=" n=")
+dat$data <- plyr::mapvalues(dat$data, from=unique(dat$data), to=unique(new_labs))
+
+## data for AUC text in plots
+yvals <- c(0.35, 0.25, 0.15, 0.05)
+xvals <- rep(0.75, 4)
+ann1 <- data.frame(FPR=xvals, TPR=yvals,
+                   data=factor(new_labs[1], levels=unique(dat$data)))
+ann2 <-  data.frame(FPR=xvals, TPR=yvals,
+                   data=factor(new_labs[2], levels=unique(dat$data)))
+ann3 <-  data.frame(FPR=xvals, TPR=yvals,
+                   data=factor(new_labs[3], levels=unique(dat$data)))
+
+col1 <- c(colss, "green")
+ggplot(dat, aes(x=FPR, y=TPR)) + 
+  geom_line(aes(color=method), size = 0.5, alpha = 0.7) +
+  scale_color_manual(values=c(col1, "green")) +
+  theme_light() +
+  labs(title="Highest quality model",  x = "False Positive Rate",  
+           y = "True Positive Rate") +
+  guides(color="none") +
+  geom_abline(slope=1, intercept=0, linetype="dashed") + 
+    facet_wrap(~data) +
+  theme(plot.title = element_text(size = 10, face = "bold"),
+    legend.background=element_rect(fill="transparent"),
+    strip.background = element_rect(color="black", fill="white", size=1, linetype="solid"),
+    strip.text = element_text(size = 6, color="black"),
+    legend.text=element_text(size=8),
+    text = element_text(size=12),
+    axis.text.x= element_text(size=10, angle=45, hjust=1)) +
+   annotate('text', x=0.75, y=0.45, label="AUC", color="black", 
+                    fontface = 'bold', size=2) +
+  geom_text(data=ann1, color=col1, label=c(ia12_auc$aucs, iss_ia12_auc), size=2) +
+  geom_text(data=ann2, color=col1, label=c(gse1_auc$aucs, iss_gse1_auc), size=2) +
+  geom_text(data=ann3, color=col1, label=c(gse2_auc$aucs, iss_gse2_auc), size=2) +
+  theme(aspect.ratio = 1)
+
+ggsave(here("output/risk_prediction_ISS_ROC_panels.pdf"))
+
+ggplot(dat, aes(x=FPR, y=TPR)) + 
+  geom_line(aes(color=method), size = 0.75, alpha = 0.7) +
+  scale_color_manual(values=c(col1, "green")) +
+  theme_light() +
+  labs(title="Highest quality model",  x = "False Positive Rate",  
+           y = "True Positive Rate") +
+  ##guides(color="none") +
+  geom_abline(slope=1, intercept=0, linetype="dashed") + 
+    facet_wrap(~data) +
+  theme(plot.title = element_text(size = 10, face = "bold"),
+    legend.background=element_rect(fill="transparent"),
+    strip.background = element_rect(color="black", fill="white", size=1, linetype="solid"),
+    strip.text = element_text(size = 6, color="black"),
+    legend.text=element_text(size=8),
+    text = element_text(size=12),
+    axis.text.x= element_text(size=10, angle=45, hjust=1)) +
+   annotate('text', x=0.75, y=0.45, label="AUC", color="black", 
+                    fontface = 'bold', size=2) +
+  geom_text(data=ann1, color=col1, label=c(ia12_auc$aucs, iss_ia12_auc), size=2) +
+  geom_text(data=ann2, color=col1, label=c(gse1_auc$aucs, iss_gse1_auc), size=2) +
+  geom_text(data=ann3, color=col1, label=c(gse2_auc$aucs, iss_gse2_auc), size=2) +
+  theme(aspect.ratio = 1)
+
+ggsave(here("output/risk_prediction_ISS_ROC_panels_legend.pdf"))
+```
+  
+### t(4;14)  
+
+```{r t414}
+dat <- rbind(ia12_t414_roc, gse1_t414_roc, gse2_t414_roc)
+dat$data <- factor(dat$data, levels=c("IA12", "GSE19784", "GSE24080"),
+                   ordered=TRUE)
+
+## data for AUC text in plots
+yvals <- c(0.33, 0.26, 0.19)
+ann1 <- data.frame(FPR=ia12_t414_auc$x_val, TPR=yvals,
+                   data=factor("IA12", levels=unique(dat$data)))
+ann2 <-  data.frame(FPR=gse1_t414_auc$x_val, TPR=yvals,
+                   data=factor("GSE19784", levels=unique(dat$data)))
+ann3 <-  data.frame(FPR=gse2_t414_auc$x_val, TPR=yvals,
+                   data=factor("GSE24080", levels=unique(dat$data)))
+    
+ggplot(dat, aes(x=FPR, y=TPR)) + 
+  geom_line(aes(color=method), size = 0.75, alpha = 0.7) +
+  scale_color_manual(values=colss) +
+  theme_light() +
+  labs(title="t(4;14)",  x = "False Positive Rate",  
+           y = "True Positive Rate") +
+  guides(color=guide_legend(order=1)) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") + 
+    facet_wrap(~data) +
+  theme(plot.title = element_text(size = 10, face = "bold"),
+    legend.title=element_text(size=10), 
+    legend.text=element_text(size=8)) +
+   theme(text = element_text(size=12)) +
+   annotate('text', x=0.75, y=0.45, label="AUC", color="black", 
+                    fontface = 'bold', size=4) +
+  geom_text(data=ann1, color=colss, label=ia12_t414_auc$aucs, size=3) +
+  geom_text(data=ann2, color=colss, label=gse1_t414_auc$aucs, size=3) +
+  geom_text(data=ann3, color=colss, label=gse2_t414_auc$aucs, size=3) +
+  theme(aspect.ratio = 1)
+```
+  
+## KM {.tabset .tabset-pills} 
+  
+### Highest quality model  
+
+```{r full_km}
+dat <- rbind(ia12_surv, gse1_surv, gse2_surv)
+dat$data <- factor(dat$data, levels=c("IA12", "GSE19784", "GSE24080"),
+                   ordered=TRUE)
+
+ia12_pfs$data=factor("IA12", levels=unique(dat$data))
+gse1_pfs$data=factor("GSE19784", levels=unique(dat$data))
+gse2_pfs$data=factor("GSE24080", levels=unique(dat$data))
+
+pvals_ia12 <- data.frame(method=c("mmSYGNAL", "GEP70", "SKY92"),                         IA12=c(signif(broom::glance(survdiff(Surv(time=PFS, event=D_PFS_FLAG)~syg_class, data=ia12_pheno))$p.value, 3), 
+                           signif(broom::glance(survdiff(Surv(time=PFS, event=D_PFS_FLAG)~gep70_class, data=ia12_pheno))$p.value, 3),
+                           signif(broom::glance(survdiff(Surv(time=PFS, event=D_PFS_FLAG)~sky92_class, data=ia12_pheno))$p.value, 3)))
+
+pvals_gse1 <- data.frame(method=c("mmSYGNAL", "GEP70", "SKY92"),                         GSE19784=c(signif(broom::glance(survdiff(Surv(time=PFS, event=D_PFS_FLAG)~syg_class, data=gse1_pheno))$p.value, 3), 
+                           signif(broom::glance(survdiff(Surv(time=PFS, event=D_PFS_FLAG)~gep70_class, data=gse1_pheno))$p.value, 3),
+                           signif(broom::glance(survdiff(Surv(time=PFS, event=D_PFS_FLAG)~sky92_class, data=gse1_pheno))$p.value, 3)))
+
+pvals_gse2 <- data.frame(method=c("mmSYGNAL", "GEP70", "SKY92"),                         GSE24080=c(signif(broom::glance(survdiff(Surv(time=PFS, event=D_PFS_FLAG)~syg_class, data=gse2_pheno))$p.value, 3), 
+                           signif(broom::glance(survdiff(Surv(time=PFS, event=D_PFS_FLAG)~gep70_class, data=gse2_pheno))$p.value, 3),
+                           signif(broom::glance(survdiff(Surv(time=PFS, event=D_PFS_FLAG)~sky92_class, data=gse2_pheno))$p.value, 3)))
+
+pval_outie <- cbind(pvals_ia12, pvals_gse1[,-1], pvals_gse2[,-1])
+colnames(pval_outie) <- c("method", "IA12", "GSE19784", "GSE24080")
+                           
+all_pfs <- rbind(ia12_pfs, gse1_pfs, gse2_pfs)
+all_pfs$y1 <- 0.05
+
+## combine med 50% PFS
+full_pfs <- as.data.frame(cbind(ia_hq, gse1_tab[,-1], gse2_tab[,-1]))
+full_pfs[,-1] <- signif(full_pfs[,-1], 3)
+heady <- c("", IA12=3, GSE19784=3, GSE24080=3)
+
+ggplot(dat, aes(x=time, y=PFS)) +
+  geom_step(aes( color=method, linetype=risk), size=0.25, alpha=0.5) + 
+  ##geom_line(aes(linetype=risk, color=method), size=0.25) +
+  scale_color_manual(values=colss) +
+  scale_linetype_manual(values=shaps, breaks=c("extreme", "high", "low")) +
+  facet_wrap(~data, scale="free_x") +
+  theme_light() +
+  theme(legend.justification=c(1,1), 
+        ##legend.position=c(1,1), 
+        legend.background=element_rect(fill="transparent"),
+        strip.background = element_rect(color="black", fill="white", size=1, linetype="solid"),
+        strip.text = element_text(size = 6, color="black"),
+        text = element_text(size=16),
+        legend.title=element_text(size=10), 
+        legend.text=element_text(size=8),
+        ##legend.spacing.y = unit(2, 'pt'),
+        ##legend.margin=unit(2, "mm"),
+        ##legend.key.height= unit(1, 'cm'),
+        ##legend.key.width= unit(2, 'cm'))
+        )+
+   theme(text = element_text(size=12)) + 
+  ##theme(legend.text = element_text(margin = margin(t = 1, b=1, unit = "pt"))) +
+  xlab("progression free survival (months)") + ylab("survival probability") +
+  geom_hline(yintercept = 0.5, linetype="dotted") +
+  theme(aspect.ratio = 1) +
+  geom_segment(data=all_pfs, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2,
+                 color=methods)) + labs(color="Method")
+  
+ggsave(here("output/risk_prediction_HQS_KM_panels_legend.pdf"))
+
+
+ggplot(dat, aes(x=time, y=PFS)) +
+   geom_step(aes( color=method, linetype=risk), size=0.5, alpha=0.5) + 
+  scale_color_manual(values=colss) +
+  scale_linetype_manual(values=shaps, breaks=c("extreme", "high", "low")) +
+  facet_wrap(~data, scale="free_x") +
+  theme_light() +
+  guides(color="none", shape="none", linetype="none") +
+  theme(legend.justification=c(1,1), 
+        ##legend.position=c(1,1), 
+        legend.background=element_rect(fill="transparent"),
+        strip.background = element_rect(color="black", fill="white", size=1, linetype="solid"),
+        strip.text = element_text(size = 8, color="black"),
+        text = element_text(size=16),
+        legend.title=element_text(size=10), 
+        legend.text=element_text(size=8),
+        ##legend.spacing.y = unit(2, 'pt'),
+        legend.margin=unit(1, "mm")) +
+   theme(text = element_text(size=12)) + 
+  theme(legend.text = element_text(margin = margin(t = 1, b=1, unit = "pt"))) +
+  xlab("progression free survival (months)") + ylab("survival probability") +
+  geom_hline(yintercept = 0.5, linetype="dotted") +
+  theme(aspect.ratio = 1) +
+  geom_segment(data=all_pfs, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2,
+                 color=methods)) + labs(color="Method")
+  
+ggsave(here("output/risk_prediction_HQS_KM_panels.pdf"))
+ 
+```
+  
+`r headerKable(full_pfs, title="highest quality model") %>% add_header_above(header=heady)`  
+  
+```{r tots}
+## get tables of
+ia12_syg <- data.frame(table(ia12_pheno$syg_class))
+ia12_gep70 <- data.frame(table(ia12_pheno$gep70_class))
+ia12_sky92 <- data.frame(table(ia12_pheno$sky92_class))
+
+ia12_syg %>%
+  dplyr::left_join(ia12_gep70, by="Var1") %>%
+  dplyr::left_join(ia12_sky92, by="Var1") %>%
+  set_colnames(c("risk", "mmSYGNAL", "GEP70", "SKY92")) %>%
+  t() ->
+ia12_all
+
+gse1_syg <- data.frame(table(cut(gse1_preds$syg_risk, breaks=c(0, 0.5, 1), 
+                            labels=c("low", "high"))))
+gse1c_gep70 <- data.frame(table(gse1_gep70$class))
+gse1c_sky92 <- data.frame(table(gse1_sky92$class))
+
+gse1_syg %>%
+  dplyr::left_join(gse1c_gep70, by="Var1") %>%
+  dplyr::left_join(gse1c_sky92, by="Var1") %>%
+  set_colnames(c("risk", "mmSYGNAL", "GEP70", "SKY92")) %>%
+  t() ->
+gse1_all
+
+gse2_syg <- data.frame(table(cut(gse2_preds$syg_risk, breaks=c(0, 0.5, 1), 
+                            labels=c("low", "high"))))
+gse2c_gep70 <- data.frame(table(gse2_gep70$class))
+gse2c_sky92 <- data.frame(table(gse2_sky92$class))
+
+gse2_syg %>%
+  dplyr::left_join(gse2c_gep70, by="Var1") %>%
+  dplyr::left_join(gse2c_sky92, by="Var1") %>%
+  set_colnames(c("risk", "mmSYGNAL", "GEP70", "SKY92")) %>%
+  t() ->
+gse2_all
+
+sig_counts <- cbind(c("mmSYGNAL", "GEP70", "SKY92"), 
+                    ia12_all[-1,], gse1_all[-1,], gse2_all[-1,])
+dimnames(sig_counts) <- list(NULL, c("methods", "extreme", "low", "high", "low",  "high", "low", "high"))
+
+heady1 <- c("", "IA12"=3, "GSE19784"=2, "GSE24080"=2)
+```
+    
+`r headerKable(sig_counts) %>% add_header_above(header=heady1)`  
+
+### t(4;14)  
+  
+```{r full_km_t414}
+dat <- rbind(ia12_surv_t4, gse1_surv_t, gse2_surv_t)
+dat$data <- factor(dat$data, levels=c("IA12", "GSE19784", "GSE24080"),
+                   ordered=TRUE)
+
+ia12_pfs_t4$data=factor("IA12", levels=unique(dat$data))
+gse1_pfs_t$data=factor("GSE19784", levels=unique(dat$data))
+gse2_pfs_t$data=factor("GSE24080", levels=unique(dat$data))
+
+all_pfs <- rbind(ia12_pfs_t4, gse1_pfs_t, gse2_pfs_t)
+all_pfs$y1 <- 0.05
+
+## combine med 50% PFS
+full_pfs <- cbind(ia_tab_t4, gse1_tab_t[,-1], gse2_tab_t[,-1])
+heady <- c("", IA12=3, GSE19784=3, GSE24080=3)
+
+ggplot(dat, aes(x=time, y=PFS)) +
+  geom_point(aes( color=method, shape=risk), size=1, alpha=0.5) + 
+  geom_line(aes(linetype=risk, color=method), size=0.25) +
+  scale_color_manual(values=colss) +
+  scale_shape_manual(values=shaps, breaks=c("extreme", "high", "low")) +
+  facet_wrap(~data, scale="free_x") +
+  theme_light() +
+  theme(legend.justification=c(1,1), 
+        ##legend.position=c(1,1), 
+        legend.background=element_rect(fill="transparent"),
+        text = element_text(size=16),
+        legend.title=element_text(size=10), 
+        legend.text=element_text(size=8),
+        ##legend.spacing.y = unit(2, 'pt'),
+        legend.margin=unit(1, "mm")) +
+   theme(text = element_text(size=12)) + 
+  theme(legend.text = element_text(margin = margin(t = 1, b=1, unit = "pt"))) +
+  xlab("progression free survival (months)") + ylab("survival probability") +
+  geom_hline(yintercept = 0.5, linetype="dotted") +
+   geom_segment(data=all_pfs, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2,
+                 color=methods)) + labs(color="Method") +
+  theme(aspect.ratio = 1)
+```
+   
+`r headerKable(full_pfs, title="t(4;14)") %>% add_header_above(header=heady)`  
+
+```{r tbaless}  
+tab1_out <- read_csv(here("data/validation/GSE19784_summary.csv"))
+tab1_out <- tab1_out[,c("clinical", "predicted", "mmSYGNAL", "GEP70", "sky92")]
+tab2_out <- read_csv(here("data/validation/GSE24080_summary.csv"))
+tab2_out <- tab2_out[,c("clinical", "predicted", "mmSYGNAL", "GEP70", "sky92")]
+
+ia12_pheno$syg_class <- factor(ia12_pheno$syg_class, 
+                                    levels=c("extreme", "high", "low"))
+ia12_pheno$gep70_class <- factor(ia12_pheno$gep70_class, 
+                                    levels=c("extreme", "high", "low"))
+ia12_pheno$sky92_class <- factor(ia12_pheno$sky92_class, 
+                                    levels=c("extreme", "high", "low"))
+ia12_pheno$risk <- factor(ia12_pheno$risk, 
+                                    levels=c("extreme", "high", "low"))
+
+ia12_syg <- as.data.frame(table(ia12_pheno[, c("risk", "syg_class")]))
+ia12_70 <- as.data.frame(table(ia12_pheno[, c("risk", "gep70_class")]))
+ia12_92 <- as.data.frame(table(ia12_pheno[, c("risk", "sky92_class")]))
+
+tab3_out <- data.frame(clinical=ia12_syg$risk, predicted=ia12_syg$syg_class, mmSYGNAL=ia12_syg$Freq, gep70=ia12_70$Freq, sky92=ia12_92$Freq) 
+
+tab3_out %>%
+  dplyr::arrange(clinical, predicted) %>%
+  dplyr::left_join(tab1_out, by=c("clinical", "predicted")) %>%
+  dplyr::left_join(tab2_out, by=c("clinical", "predicted")) ->
+  all_out  
+
+colnames(all_out) <- c("clinical", "predicted", rep(c("mmSYGNAL", "GEP70", "SKY92"), 3))
+
+datas <- c("risk"=2, IA12=3, GSE19784=3, GSE24080=3)
+```
+  
+## Summary: predicted risk class  
+  
+`r headerKable(all_out) %>% add_header_above(header=datas)` 
+  
+`r headerKable(pval_outie)`  
+      
+  
+# ROC mmSYGNAL  
+  
+```{r full_roc_model}
+
+dat <- rbind(ia12_roc[ia12_roc$method=="SYGNAL",], 
+             gse1_roc[gse1_roc$method=="SYGNAL",], 
+             gse2_roc[gse2_roc$method=="SYGNAL",])
+dat$data <- factor(dat$data, levels=c("IA12", "GSE19784", "GSE24080"),
+                   ordered=TRUE)
+
+## data for AUC text in plots
+yvals <- c(0.35, 0.25, 0.15)
+ann1 <- data.frame(FPR=ia12_auc$x_val, TPR=yvals,
+                   data=factor("IA12", levels=unique(dat$data)))
+ann2 <-  data.frame(FPR=gse1_auc$x_val, TPR=yvals,
+                   data=factor("GSE19784", levels=unique(dat$data)))
+ann3 <-  data.frame(FPR=gse2_auc$x_val, TPR=yvals,
+                   data=factor("GSE24080", levels=unique(dat$data)))
+    
+ggplot(dat, aes(x=FPR, y=TPR)) + 
+  geom_line(aes(color=data), size = 0.75, alpha = 0.7) +
+  scale_color_manual(values=colss) +
+  theme_light() +
+  labs(title="Highest quality model",  x = "False Positive Rate",  
+           y = "True Positive Rate") +
+  geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme(legend.justification=c(1,1), 
+        ##legend.position=c(1,1), 
+        legend.background=element_rect(fill="transparent"),
+        text = element_text(size=20),
+        legend.title=element_text(size=16), 
+        legend.text=element_text(size=14),
+        ##legend.spacing.y = unit(2, 'pt'),
+        legend.margin=unit(1, "mm")) +
+   annotate('text', x=0.75, y=0.45, label="AUC", color="black", 
+                    fontface = 'bold', size=8) +
+  annotate('text', x=0.75, y=0.35, label=ia12_auc$aucs[1], color="black", 
+                    fontface = 'bold', size=8) +
+   annotate('text', x=0.75, y=0.25, label=gse1_auc$aucs[1], color=colss[2], 
+                    fontface = 'bold', size=8) +
+   annotate('text', x=0.75, y=0.15, label=gse2_auc$aucs[1], color=colss[3], 
+                    fontface = 'bold', size=8) +
+  theme(aspect.ratio = 1)
+ggsave(here("output/risk_prediction_HQS_ROC.pdf"))
+```
+
+```{r full_km_mmsygnal}
+
+dat <- rbind(ia12_surv[ia12_surv$method=="SYGNAL",], 
+             gse1_surv[gse1_surv$method=="SYGNAL",], 
+             gse2_surv[gse2_surv$method=="SYGNAL",])
+dat$data <- factor(dat$data, levels=c("IA12", "GSE19784", "GSE24080"),
+                   ordered=TRUE)
+
+ia12_pfs$data=factor("IA12", levels=unique(dat$data))
+gse1_pfs$data=factor("GSE19784", levels=unique(dat$data))
+gse2_pfs$data=factor("GSE24080", levels=unique(dat$data))
+
+all_pfs <- rbind(ia12_pfs, gse1_pfs, gse2_pfs)
+all_pfs$y1 <- 0.05
+all_pfs <- all_pfs[all_pfs$methods=="SYGNAL",]
+
+## combine med 50% PFS
+full_pfs <- cbind(ia_tab, gse1_tab[,-1], gse2_tab[,-1])
+heady <- c("", IA12=3, GSE19784=2, GSE24080=2)
+
+ggplot(dat, aes(x=time, y=PFS)) +
+  geom_point(aes( color=data, shape=risk), size=1, alpha=0.5) + 
+  geom_line(aes(linetype=risk, color=data), size=0.25) +
+  scale_color_manual(values=colss) +
+  scale_shape_manual(values=shaps, breaks=c("extreme", "high", "low")) +
+  theme_light() +
+  theme(legend.justification=c(1,1), 
+        ##legend.position=c(1,1), 
+        legend.background=element_rect(fill="transparent"),
+        text = element_text(size=20),
+        legend.title=element_text(size=16), 
+        legend.text=element_text(size=14),
+        ##legend.spacing.y = unit(2, 'pt'),
+        legend.margin=unit(1, "mm")) +
+   theme(text = element_text(size=16)) + 
+  theme(legend.text = element_text(margin = margin(t = 1, b=1, unit = "pt"))) +
+  xlab("PFS months") + ylab("survival probability") +
+  geom_hline(yintercept = 0.5, linetype="dotted") +
+  theme(aspect.ratio = 1) +
+  geom_segment(data=all_pfs, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2,
+                 color=data)) + labs(color="Method")
+ggsave(here("output/risk_prediction_HQS_KM.pdf"))
+```
+
+  
+  
+  

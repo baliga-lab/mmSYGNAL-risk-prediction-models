@@ -1,0 +1,1442 @@
+---
+title: "SCCA MM patients"
+author: "Carl Murie"
+date: "`r format(Sys.Date(),'%e de %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE)
+options(knitr.duplicate.label = "allow")
+```
+
+```{r libraries}
+library(tidyverse)
+library(knitr)
+library(here)
+library(readr)
+library(magrittr)
+library(stringr)
+library(tibble)
+library(data.table)
+library(ggplot2)
+library(kableExtra)
+library(gridExtra)
+library(survival)
+library(jsonlite)
+library(caret)
+library(ComplexHeatmap)
+library(htmltools)
+library(DT)
+library(matrixStats)
+library(RNASeqUtilities)
+library(ggpubr)
+library(survminer)
+
+source(here("code/utilities.R"))
+source(here("code/utilities_drug.R"))
+source(here("code/drug_therapy_functions.R"))
+```
+  
+  
+```{r load}
+dat_path <- "~/mnt/omics/SYGNAL/MM_drug_validation/data/scca/"
+drug_path <- "~/mnt/omics/SYGNAL/MM_drug_validation/drug_targets"
+
+## esembl symbol mappings
+gen_sym <- read_csv(here("data/IA12_gene_symbols.csv"))
+
+## SCCA miner best predictions: reformat to match scca_best 
+scca_miner <- read_csv( here("data/scca_risk_miner_pheno.csv"))
+
+scca_miner %>%
+  dplyr::rename(pid=PatientID,
+                prediction=miner_risk,
+                quality=miner_quality,
+                class=miner_class) %>%
+  dplyr::select(pid, prediction, quality, class) ->
+  tmp
+
+tmp$pid[1:3] <- paste("0", tmp$pid[1:3], sep="")
+scca_best <- tmp
+colnames(scca_best) <- c("sample", "risk", "quality", "class")
+scca_best$pid <- as.numeric(str_remove(scca_best$sample, pattern="MM"))
+
+## scca first cohort
+scca1_risk <- read_csv(here("data/scca_risk_prediction.csv"))
+scca1_risk_all <- read_csv(here("data/scca_all_risk_prediction_plot.csv"))
+colnames(scca1_risk_all) <- c("sample", "subtype", "risk", "class")
+scca1_risk_all$pid <- scca1_risk_all$sample
+
+## SCCA RNASeq data cohort 2
+scca_reg <- read_csv(here("data/program_activity_scca2_py.csv"))
+
+## SCCA cohort 2 cytogenetics
+scca2_pheno <- read_csv(here("data/scca_c2_pheno.csv"))
+
+## scca risk prediction results
+best <- read_csv(here("data/scca2_risk_prediction_highest_quality.csv"))
+all_preds <- read_csv(here("data/scca2_risk_prediction.csv"))
+all_preds$pid <- as.numeric(str_sub(all_preds$sample, start=3))
+
+## add scca1 subjects
+all_preds <- rbind(all_preds, scca1_risk_all)
+
+## SCCA clinical data for both cohorts (miner_pheno is updated with new results)
+scca_pheno <- read_csv(here("data/scca_risk_miner_pheno.csv"))
+
+## map new miner normalized results to standard names
+scca_pheno %>%
+  dplyr::mutate(mmSYGNAL=miner_risk) %>%
+  dplyr::mutate(mmSYGNAL_class=miner_class) ->
+  scca_pheno
+
+## get risk probabilities for 
+read_csv(here("data/ia12_risk_subtypes.csv")) %>%
+  dplyr::filter(subtype != "del17p") -> 
+  mmsyg_risk
+
+## set up subtype information
+subtypes <- c("all", "WHSC1", "FGFR3", "amp1q", "del13", "del1p")
+sub_labels <- factor(c("agnostic", "t(4;14)", "FGFR3", "amp(1q)", "del(13)", "del(1p)"), ordered=TRUE) 
+
+```
+
+# Summary  
+
+```{r summary}
+
+scca_pheno %<>% dplyr::mutate(truth=ifelse(PFS_real <= 3*365 & relapse==TRUE, 1, 0)) 
+
+scca_dt <- data.table(scca_pheno)
+
+getSamps <- function(count, mat=scca_pheno, doBi=FALSE) {
+    
+  if(doBi) {
+     mat %>%
+       dplyr::filter(cyto_count>count) ->
+       tmp
+  } else {
+     mat %>%
+       dplyr::filter(cyto_count==count) ->
+       tmp
+  }
+  
+    total <- nrow(tmp)
+    high <- sum(tmp$truth==1)
+    low <- sum(tmp$truth==0)
+    return(c(total=as.character(total), high=paste0(round(high/total, 2)*100, "%"),
+             low=paste0(round(low/total, 2)*100, "%") ) )
+}
+
+res <- t(sapply(0:3, getSamps))
+res1 <- getSamps(0, doBi=TRUE)
+
+res_both <- rbind(res[1,], res1, res[2:4,])
+outie <- data.frame("cyto counts"=c(0, ">0", 1:3), res_both)
+row.names(outie) <- NULL
+colnames(outie)[1] <- "cyto count"
+```
+
+`r headerKable(outie, title="SCCA cytogenetics")`
+
+# Swimmer plots  
+
+```{r more_pheno}
+
+## read in updated data and compare to old data
+read_csv(here("data/SCCA_updated_pheno.csv")) %>%
+  dplyr::mutate(newID=as.numeric(str_replace_all(Patient_ID, "MM|9944-", ""))) %>%
+  dplyr::arrange(newID) %>%
+  dplyr::mutate(relapse=ifelse(PFS_status=="Progressed", TRUE, FALSE)) %>%
+  dplyr::rename(PFS_real=Post_collection_PFS) ->
+  pheno_new
+
+scca_pheno %<>%
+   dplyr::left_join(pheno_new[, c("newID", "OS_status")],
+                   by="newID") 
+  # dplyr::left_join(pheno_new[, c("newID", "relapse", "PFS_real", "OS", "Age_at_Collection",
+  #                                "Stage", "Sex",
+  #                                "Percent_Plasma_Cells", "Lines_of_prior_therapy",
+  #                                "Post_collection_treatment", "OS_status", "Cause_of_death")],
+  #                  by="newID") ->
+
+```
+  
+```{r full}
+## join sygnal risk prediction to phenotype file
+
+scca_pheno  %>%
+  dplyr::mutate(OS=OS/30) %>%
+  dplyr::mutate(OSFromEnrollment=OSFromEnrollment/30) %>%
+  dplyr::mutate(PFS_real=PFS_real/30) %>%
+  dplyr::mutate(InitialPFS=as.numeric(InitialPFS)/30) ->
+  scca_tmp
+
+scca_tmp %>%
+  ##dplyr::left_join(scca_best, by=c("newID"="sample")) %>%
+  dplyr::mutate(enrollment=OS-OSFromEnrollment) %>%
+  dplyr::mutate(collection=OS-PFS_real) %>%
+  dplyr::mutate(ongoing=ifelse(relapse==FALSE, "norelapse", NA)) ->
+  plot_pheno
+
+plot_pheno %>%
+  dplyr::select(newID, collection) %>%
+  dplyr::rename(value=collection) %>%
+  dplyr::mutate(event="RNASeq sample\ncollection") ->
+  shape2
+
+plot_pheno %>%
+  dplyr::select(newID, OS_status, OS) %>%
+  dplyr::mutate(event=ifelse(OS_status=="Alive", NA, OS_status)) %>%
+  dplyr::rename(value=OS) %>%
+  dplyr::select(-OS_status) ->
+  shape3a
+
+
+plot_pheno %>%
+  dplyr::select(newID, InitialPFS) %>%
+  dplyr::rename(value=InitialPFS) %>%
+  dplyr::mutate(event="initial relapse") ->
+  shape4
+shape4$value[shape4$value=="NP"] <- NA
+
+as.data.frame(rbind(shape2, shape3a, shape4)) %>%
+  dplyr::filter(!is.na(event)) %>%
+  dplyr::mutate(value=as.numeric(value)) ->
+  shapey
+
+```
+
+```{r swim1, eval=TRUE}
+
+## schwimmer plot
+library(swimplot)
+df_plot <- as.data.frame(plot_pheno)
+df_plot$newID <- as.character(df_plot$newID)
+
+df_arr <- as.data.frame(as.matrix(df_plot[, c("newID", "OS", "ongoing")]))
+df_arr$ongoing <- ifelse(df_arr$ongoing=="norelapse", "norelapse", NA)
+df_arr$newID <- as.character(df_arr$newID)
+
+##write_csv(df_plot, here("output/serdar/df_plot.csv"))
+##write_csv(shapey, here("output/serdar/shapey.csv"))
+
+s1 <- swimmer_plot(df=df_plot,id='newID',end='OS' , width=.85, name_fill='relapse') + 
+      ggplot2::scale_shape_manual(name="event",values=c(20,8, 1, 2, 0),
+      breaks=c('RNASeq sample\ncollection', 'initial relapse', "Dead",
+               "Non-MM death", "Unknown death")) +
+      swimmer_points(df=shapey,id='newID', time='value', name_shape='event',  size=2) +
+      ##swimmer_arrows(df_arrows=df_arr, id='newID', arrow_start='OS',  
+      ##           cont='ongoing', type="open", length=0.1,
+      ##          arrow_positions=c(1,15)) +
+      swimmer_lines(df_lines=df_plot, id='newID', start='collection',end = 'OS')
+
+print(s1)
+##ggpubr::ggarrange(s1, labels="A", font.label = list(color = "black", face = "bold"))
+
+shapey2 <- as.data.frame(rbind( shape2, shape3a, shape4))
+shapey2$value <- as.numeric(shapey2$value)
+##write_csv(shapey2, here("output/serdar/shapey2.csv"))
+
+s2 <- swimmer_plot(df=df_plot,id='newID',end='OS' , width=.85,
+             name_fill='DiseaseStatus') + 
+      ggplot2::scale_shape_manual(name="event",values=c(20,8, 1, 2, 0),
+     breaks=c('RNASeq sample\ncollection', 'initial relapse', "Dead",
+               "Non-MM death", "Unknown death")) +
+     swimmer_points(df=shapey2, id='newID', time='value', name_shape='event',  size=2) +
+     ##swimmer_arrows(df_arrows=df_plot, id='newID', arrow_start='OS',  
+      ##           cont='ongoing', type="open", length=0.1, arrow_positions=c(1,15)) +
+     swimmer_lines(df_lines=df_plot, id='newID',
+                          start='collection',end = 'OS') +
+    guides(fill=guide_legend(title="disease status"))
+print(s2)
+ggsave(here("output/man_scca_swimmer_pluslegend.pdf"), device="pdf")
+
+s3 <- swimmer_plot(df=df_plot,id='newID',end='OS' , width=.85,
+             name_fill='DiseaseStatus') + 
+      ggplot2::scale_shape_manual(name="event",values=c(20,8, 1, 2, 0),
+      breaks=c('RNASeq sample\ncollection', 'initial relapse', "Dead",
+               "Non-MM death", "Unknown death")) +
+  swimmer_points(df=shapey2,id='newID', time='value', name_shape='event',  size=2) +
+  ##swimmer_arrows(df_arrows=df_plot, id='newID', arrow_start='OS',  
+  ##               cont='ongoing', type="open", length=0.1,
+  ##               arrow_positions=c(1,15)) +
+swimmer_lines(df_lines=df_plot,id='newID',
+                          start='collection',end = 'OS') +
+  guides(color="none", fill="none", shape="none") +
+  ylab("Overall Survival (months)") + xlab("Patient ID") +
+  theme(aspect=4/4)
+print(s3)
+ggsave(here("output/man_scca_swimmer.pdf"), device="pdf")
+
+```
+   
+# mmSYGNAL risk vs clinical outcome  
+
+```{r more}
+
+scca_pheno %>%
+  ##dplyr::left_join(scca_best, by=c("PatientID"="sample"))%>%
+  dplyr::mutate(PFS_real=PFS_real/30) %>%
+  dplyr::mutate(risk=mmSYGNAL) %>%
+  dplyr::mutate(class=mmSYGNAL_class) %>%
+  dplyr::select(newID, PFS_real, risk, DiseaseStatus, class, relapse, cohort) ->
+  ##dplyr::filter(newID!="MM83") ->
+  plot_pheno
+
+title_size <- 15
+font_size=4
+point_size=5 
+cor_pfs <- signif(cor(plot_pheno$PFS_real, plot_pheno$risk), 3)
+g1 <- ggplot(plot_pheno, aes(x=PFS_real, y=risk)) +
+  ##scale_color_manual(values=c("red", "green", "blue"),
+  ##                   labels=c("extreme", "high", "low")) +
+  geom_point(aes(color=DiseaseStatus, shape=relapse), size=point_size) + 
+   ggtitle("mmSYGNAL") + 
+  ylab("risk score") + xlab("PFS months") +
+   geom_text(aes(label=newID, color=DiseaseStatus), hjust=-0.5, vjust=-0.05) +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dashed") +
+  geom_hline(yintercept=c(0.5, 0.6), linetype="dotted") +
+   theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+   ylim(0.2,0.75) + 
+   ##xlim(0, 95) +
+   labs(color="disease status") 
+print(g1)
+
+g1c <- ggplot(plot_pheno, aes(x=PFS_real, y=risk)) +
+  ##scale_color_manual(values=c("red", "green", "blue"),
+  ##                   labels=c("extreme", "high", "low")) +
+  geom_point(aes(color=DiseaseStatus, shape=relapse), size=point_size) + 
+  ylab("risk score") + xlab("PFS months") +
+   geom_text(aes(label=newID, color=DiseaseStatus), hjust=-0.5, vjust=-0.05) +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dashed") +
+  geom_hline(yintercept=c(0.5, 0.6), linetype="dotted") +
+   theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+   ylim(0.2,0.75) + 
+   xlim(0, 135) +
+   guides(color="none", shape="none") 
+print(g1c)
+ggsave(here("output/man_scca_scatter_summary.pdf"), device="pdf")
+
+
+##ggpubr::ggarrange(plotlist=list(s3, g1c), labels=c("A", "B"), font.label = list(color = "black", face = "bold"))
+
+g1a <- ggplot(plot_pheno, aes(x=PFS_real, y=risk)) +
+  scale_color_manual(values=c("red", "green", "blue"),
+                     labels=c("extreme", "high", "low")) +
+  geom_point(aes(color=class, shape=DiseaseStatus), size=point_size) + 
+   ggtitle("mmSYGNAL") + 
+  ylab("risk score") + xlab("PFS months") +
+   geom_text(aes(label=newID, color=class), hjust=-0.5, vjust=-0.05) +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dotted") +
+  geom_hline(yintercept=c(0.5, 0.6), linetype="dashed") +
+   theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+   ylim(0.2,0.75) + 
+  xlim(0, 95) +
+  guides(color="none", shape="none")
+
+
+g2 <- ggplot(plot_pheno[plot_pheno$cohort==1,], aes(x=PFS_real, y=risk)) +
+  scale_color_manual(values=c("red", "green", "blue"),
+                     labels=c("extreme", "high", "low")) +
+  geom_point(aes(color=class, shape=DiseaseStatus), size=point_size) + 
+   ggtitle("mmSYGNAL") + 
+  ylab("risk score") + xlab("PFS months") +
+   geom_text(aes(label=newID, color=class), hjust=-0.75, vjust=-0.05) +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dotted") +
+  geom_hline(yintercept=c(0.5, 0.6), linetype="dashed") +
+   theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+   ylim(0.2,0.75) + 
+   xlim(0, 10) +
+  guides(color="none", shape="none")
+
+g2a <- ggplot(plot_pheno[plot_pheno$cohort==1,], aes(x=PFS_real, y=risk)) +
+  scale_color_manual(values=c("red", "green", "blue"),
+                     labels=c("extreme", "high", "low")) +
+  geom_point(aes(color=class, shape=DiseaseStatus), size=point_size) + 
+   ggtitle("mmSYGNAL") + 
+  ylab("risk score") + xlab("PFS months") +
+   geom_text(aes(label=newID, color=class), hjust=-0.75, vjust=-0.05) +
+  geom_hline(yintercept=c(0.5, 0.6), linetype="dashed") +
+   theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+   ylim(0.2,0.75) + 
+   xlim(0, 10) 
+```
+
+## Compare normalization: within vs across sample  
+ 
+```{r asamp}
+
+best_samp <- read_csv(here("data/pred_risk_asamp.csv"))
+
+best_samp %<>%
+  dplyr::mutate(newID=as.numeric(str_replace(sample, "MM", "")))
+
+title_size <- 15
+font_size=4
+point_size=5 
+cor_pfs <- signif(cor(plot_pheno$PFS_real, plot_pheno$risk), 3)
+gnorm1 <- ggplot(plot_pheno, aes(x=PFS_real, y=risk)) +
+  scale_color_manual(values=c("red", "green", "blue"),
+                     labels=c("extreme", "high", "low")) +
+  geom_point(aes(color=class, shape=relapse), size=point_size) + 
+   ggtitle("within samples") + 
+  ylab("risk score") + xlab("PFS months") +
+   geom_text(aes(label=newID, color=class), hjust=-0.5, vjust=-0.05) +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dashed") +
+  geom_hline(yintercept=c(0.5, 0.6), linetype="dotted") +
+   theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+   ylim(0.1, 0.75) + 
+   ##xlim(0, 95) +
+   labs(color="risk class") 
+print(gnorm1)
+
+gnorm2 <- ggplot(best_samp, aes(x=PFS_real, y=risk)) +
+  scale_color_manual(values=c("green", "blue"),
+                     labels=c("high", "low")) +
+  geom_point(aes(color=class, shape=relapse), size=point_size) + 
+   ggtitle("across samples") + 
+  ylab("risk score") + xlab("PFS months") +
+   geom_text(aes(label=newID, color=class), hjust=-0.5, vjust=-0.05) +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dashed") +
+  geom_hline(yintercept=c(0.5, 0.6), linetype="dotted") +
+   theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+   ylim(0.1, 0.75) + 
+   ##xlim(0, 95) +
+   labs(color="risk class") 
+print(gnorm2)
+```
+
+
+```{r panels}
+sky <- read_csv(here("data/SCCA_sky92_all.csv"))
+gep <- read_csv(here("data/SCCA_gep70_all.csv"))
+
+all_panel <- data.frame(sample=sky$sample, sky92=as.numeric(sky$scores),
+                    sky92_class=sky$class,
+                    gep70=as.numeric(gep$scores), gep70_class=gep$class)
+all_panel$sample <- as.numeric(str_replace(all_panel$sample, pattern="MM",
+                                           replacement=""))
+
+plot_pheno %>%
+  dplyr::left_join(all_panel, by=c("newID"="sample")) %>%
+  dplyr::mutate(sky92_class=factor(sky92_class, levels=c("extreme", "high", "low"))) ->
+  plot_panel
+
+gep70_cut_paper <- 0.66
+sky_cut_paper <- 0.827
+
+plot_pheno %>%
+  dplyr::mutate(method="mmSYGNAL") %>%
+  dplyr::mutate(set="full") ->
+all_pheno
+
+plot_panel %>%
+  dplyr::mutate(risk=sky92) %>%
+  dplyr::mutate(class=sky92_class) %>%
+  dplyr::mutate(method="SKY92") %>%
+  dplyr::mutate(set="full") %>%
+  dplyr::select(-sky92, -sky92_class, -gep70, -gep70_class) ->
+  sky_pheno
+
+plot_panel %>%
+  dplyr::mutate(risk=gep70) %>%
+  dplyr::mutate(class=gep70_class) %>%
+  dplyr::mutate(method="GEP70") %>%
+  dplyr::mutate(set="full") %>%
+  dplyr::select(-sky92, -sky92_class, -gep70, -gep70_class) ->
+  gep_pheno
+
+scca_pheno %>%
+  dplyr::mutate(risk=cyto_count) %>%
+  dplyr::mutate(class=cyto_class) %>%
+  dplyr::mutate(method="cytogenetics") %>%
+  dplyr::mutate(set="full") %>%
+  dplyr::select(newID, PFS_real, risk, DiseaseStatus, class, relapse, cohort, method, set) ->
+  cyto_pheno
+
+all_pheno <- rbind(all_pheno, sky_pheno, gep_pheno)
+all_pheno %<>%
+  dplyr::left_join(scca_pheno[, c("newID", "cyto_class")], by="newID") 
+
+all_pheno %>% 
+  dplyr::filter(cohort==1) %>%
+  dplyr::mutate(set="advanced") ->
+  all_pheno1
+  
+all_both <- rbind(all_pheno, all_pheno1)
+cut_lines <- data.frame(method=c("mmSYGNAL", "mmSYGNAL", "GEP70", "SKY92"),
+                         cuts=c(0.5, 0.6, gep70_cut_paper, sky_cut_paper))
+```
+
+
+
+
+```{r all_meth}
+
+s_size <- 3
+
+ ggplot(all_both, aes(x=PFS_real, y=risk)) +
+  scale_color_manual(values=c("red", "green", "blue"),
+                     labels=c("extreme", "high", "low")) +
+  ##scale_shape_manual(values=c(0,19)) +
+  geom_point(aes(color=class), size=s_size) + 
+  geom_hline(data=cut_lines, aes(yintercept=cuts), linetype="dashed") +
+   geom_smooth(method=lm, se=FALSE, size=0.25,  color="black", linetype="solid") +
+  facet_wrap(fct_relevel(set, "full", "advanced")~fct_relevel(method, "mmSYGNAL", "GEP70", "SKY92"), scales="free", nrow=3, ncol=3) +
+  ylab("risk score") + xlab("PFS months") +
+   theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+   theme(aspect.ratio=1:1) +
+   theme(axis.text = element_text(size = 8))
+
+ 
+ ggplot(all_both, aes(x=PFS_real, y=risk)) +
+  scale_color_manual(values=c("red", "green", "blue"),
+                     labels=c("extreme", "high", "low")) +
+  geom_point(aes(color=class, shape=relapse), size=1.5) + 
+    theme_light() +
+  geom_hline(data=cut_lines, aes(yintercept=cuts), linetype="dashed", size=0.25) +
+   geom_smooth(method=lm, se=FALSE, size=0.25,  color="black", linetype="solid") +
+     geom_smooth(data=all_both[all_both$newID!=21 & all_both$cohort==1,], method=lm, se=FALSE, size=0.50,  color="red", linetype="dashed") +
+     geom_smooth(data=all_both[all_both$relapse=="TRUE" & all_both$set=="full",], method=lm, se=FALSE, size=0.25,  color="red", linetype="dashed") +
+   facet_wrap(fct_relevel(set,"full", "advanced")~fct_relevel(method, "mmSYGNAL", "GEP70", "SKY92"), scales="free", nrow=3, ncol=3) +
+  ylab("risk score") + xlab("PFS months") +
+    ##guides(color="none", shape="none") +
+   theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+   theme(aspect.ratio=1:1) +
+   theme(axis.text = element_text(size = 9)) +
+    geom_text(aes(label=newID), hjust=-0.5, size=1.5) 
+ 
+  ##ggsave(here("output/manuscript/figures/Mar10_22/man_scca_pfs_id.pdf"), device="pdf")
+  ggsave(here("output/supp_fig3.pdf"), device="pdf")
+  
+  cor_all <- as.data.table(all_pheno1)[,.(meth_cor=cor(PFS_real, risk)), by=method]
+  cor_all_p <- as.data.table(all_pheno1)[,.(meth_cor=cor.test(PFS_real, risk)$p.value), by=method]
+  cor_mini <- as.data.table(all_pheno1[all_pheno1$newID!=21,])[,.(meth_cor=cor(PFS_real, risk)), by=method]
+  cor_mini_p <- as.data.table(all_pheno1[all_pheno1$newID!=21,])[,.(meth_cor=cor.test(PFS_real, risk)$p.value), by=method]
+   
+  cor_all <- as.data.frame(rbind(cbind(cor_all, cor_all_p[,2]), cbind(cor_mini, cor_mini_p[,2])))
+  cor_all$type <- c(rep("with 21", 3), rep("w/o 21", 3))
+  colnames(cor_all) <- c("method", "cor", "pvalue", "type")
+  cor_all[,2:3]<- round(cor_all[,2:3], 2)
+  
+  ggplot(all_pheno1, aes(x=PFS_real, y=risk)) +
+  scale_color_manual(values=c("red", "green", "blue"),
+                     labels=c("extreme", "high", "low")) +
+   theme_light() +
+  geom_point(aes(color=class), size=1.5) + 
+  geom_hline(data=cut_lines, aes(yintercept=cuts), linetype="dotted", size=0.25) +
+   geom_smooth(method=lm, se=FALSE, size=0.25,  color="black", linetype="solid") +
+   geom_smooth(data=all_pheno1[all_pheno1$newID!=21,], method=lm, se=FALSE, size=0.25,  color="black", linetype="dashed") +
+   facet_wrap(~fct_relevel(method, "mmSYGNAL", "GEP70", "SKY92"), scales="free_y", nrow=2, ncol=3) +
+  ylab("Risk score") + xlab("PFS months") +
+    guides(color="none", shape="none") +
+  theme(plot.title = element_text(size=9, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=12),
+    text = element_text(size=12),
+    axis.text.y= element_text(size=10, angle=0, hjust=1,face="bold"),
+    axis.text.x= element_text(size=10, angle=45, hjust=1,face="bold"),
+    strip.background = element_rect(
+          color="black", fill="white", size=0.25, linetype="solid"),
+        strip.text = element_text(size = 8, color = "black", face = "bold")) +
+   theme(aspect.ratio=1:1) +
+   theme(axis.text = element_text(size = 10)) +
+    geom_text(aes(label=newID, color=class), hjust=-0.5, size=3.5) + 
+  xlim(0,10) +
+   scale_linetype_manual(name="correlation", breaks=c("with 21", "w/o 21"), labels=c("solid", "dotted"))
+ggsave(here("output/man_scca_pfs_multirelapse.pdf"),device="pdf") 
+```   
+
+
+
+
+## Leave one out correlations {.tabset .tabset-pills}
+
+```{r corrs}
+## calculate leave one out correlations
+looCor <- function(pfs, score, doPlot=FALSE, method=NULL) {
+  outie <- NULL
+  plottie <- list()
+  for(i in 1:length(pfs)) {
+     tmp <- cor(pfs[-i], score[-i])
+     outie <- c(outie, tmp)
+  
+     plottie[[i]] <- ggplot(data.frame(pfs=pfs[-i], score=score[-i]), aes(x=pfs, y=score)) + geom_point() + geom_smooth(method="lm") + ggtitle(signif(tmp, 3))
+    
+  }
+
+  return(list(cors=outie, plots=plottie))
+}
+
+## extract multiple relapse patients
+all_both %>% dplyr::filter(set=="advanced") -> set1
+all_both %>% dplyr::filter(set=="advanced") %>%
+  dplyr::filter(newID != 21) -> 
+  set2
+```
+
+### mmSYGNAL
+
+#### All patients
+```{r}
+## mmSYGNAL
+set1 %>% dplyr::filter(method=="mmSYGNAL") -> tmp
+syg_cor1 <- looCor(pull(tmp, PFS_real), pull(tmp, risk), method="mmSYGNAL")
+grid.arrange(grobs=syg_cor1$plots, nrow=3, ncol=3)
+```
+
+#### Minus patient 21
+
+```{r}
+set2 %>% dplyr::filter(method=="mmSYGNAL") -> tmp
+syg_cor2 <- looCor(pull(tmp, PFS_real), pull(tmp, risk), method="mmSYGNAL")
+grid.arrange(grobs=syg_cor2$plots, nrow=3, ncol=3)
+```
+
+### GEP70
+
+#### All patients
+```{r}
+## GEP70
+set1 %>% dplyr::filter(method=="GEP70") -> tmp
+gep_cor1 <- looCor(pull(tmp, PFS_real), pull(tmp, risk), method="GEP70")
+grid.arrange(grobs=gep_cor1$plots, nrow=3, ncol=3)
+```
+
+#### Minus patient 21
+
+```{r}
+set2 %>% dplyr::filter(method=="GEP70") -> tmp
+gep_cor2 <- looCor(pull(tmp, PFS_real), pull(tmp, risk), method="GEP70")
+grid.arrange(grobs=syg_cor2$plots, nrow=3, ncol=3)
+```
+
+### SKY92  
+
+#### All patients
+```{r}
+## SKY92
+set1 %>% dplyr::filter(method=="SKY92") -> tmp
+sky_cor1 <- looCor(pull(tmp, PFS_real), pull(tmp, risk))
+grid.arrange(grobs=sky_cor1$plots, nrow=3, ncol=3)
+```
+
+#### Minus patient 21
+
+```{r}
+set2 %>% dplyr::filter(method=="SKY92") -> tmp
+sky_cor2 <- looCor(pull(tmp, PFS_real), pull(tmp, risk), method="SKY92")
+grid.arrange(grobs=syg_cor2$plots, nrow=3, ncol=3)
+```
+
+
+## Boxplots of correlations  
+
+```{r}
+all_cor1 <- data.frame(method=factor(rep(c("mmSYGNAL", "GEP70", "SKY92"), each=length(syg_cor1$cors)), levels=c("mmSYGNAL", "GEP70", "SKY92"), ordered=TRUE),
+                      corr=c(syg_cor1$cors, gep_cor1$cors, sky_cor1$cors))
+
+ggplot(all_cor1, aes(x=method, y=corr)) + geom_boxplot() +
+  ylim(c(0, -1)) + ggtitle("All patients")
+
+all_cor2 <- data.frame(method=factor(rep(c("mmSYGNAL", "GEP70", "SKY92"), each=length(syg_cor2$cors)), levels=c("mmSYGNAL", "GEP70", "SKY92"), ordered=TRUE),
+                      corr=c(syg_cor2$cors, gep_cor2$cors, sky_cor2$cors))
+
+ggplot(all_cor2, aes(x=method, y=corr)) + geom_boxplot()  + ggtitle("Minus patient 21") + ylim(0.5, -1)
+```
+
+```{r sky}
+
+## correlations
+cor_pfs <- c(pearson=signif(cor(plot_pheno$PFS_real,
+                                plot_panel$sky92), 3),
+             spearman=signif(cor(plot_pheno$PFS_real, 
+                                 plot_panel$sky92, method="spearman"), 3))
+
+cor_test <- c(pearson=signif(cor.test(plot_pheno$PFS_real, 
+                                      plot_panel$sky92)$p.value, 3),
+             spearman=signif(cor.test(plot_pheno$PFS_real,
+                                      plot_panel$sky92, 
+                                      method="spearman")$p.value, 3))
+ pan1 <- ggplot(plot_panel, aes(x=PFS_real, y=sky92)) +
+  geom_point(aes(color=sky92_class, shape=DiseaseStatus), size=point_size) + 
+ scale_color_manual(values=c("green", "red", "blue")) +
+  ggtitle("SKY92") + 
+  labs(y="") + xlab("PFS months") +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dotted") +
+  theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+  geom_hline(yintercept=sky_cut_paper, linetype="dashed") +
+    geom_text(aes(label=newID, color=sky92_class), hjust=-0.5) +
+    ylim(0.75, max(plot_panel$sky92)+0.2) + xlim(0, 95) +
+   guides(color="none", shape="none")
+
+ pan1a <- ggplot(plot_panel[plot_panel$cohort==1,], aes(x=PFS_real, y=sky92)) +
+  geom_point(aes(color=sky92_class, shape=DiseaseStatus), size=point_size) + 
+ scale_color_manual(values=c("green", "red", "blue")) +
+  ggtitle("SKY92") + 
+  labs(y="") + xlab("PFS months") +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dotted") +
+  theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+  geom_hline(yintercept=sky_cut_paper, linetype="dashed") +
+    geom_text(aes(label=newID, color=sky92_class), hjust=-0.6) +
+    ylim(0.5, max(plot_panel$sky92)+0.2) + xlim(0, 10) +
+   guides(color="none", shape="none")
+
+```
+
+
+```{r gep}
+
+## correlations
+cor_pfs <- c(pearson=signif(cor(plot_pheno$PFS_real,
+                                plot_panel$gep70), 3),
+             spearman=signif(cor(plot_pheno$PFS_real, 
+                                 plot_panel$gep70, method="spearman"), 3))
+
+cor_test <- c(pearson=signif(cor.test(plot_pheno$PFS_real, 
+                                      plot_panel$gep70)$p.value, 3),
+             spearman=signif(cor.test(plot_pheno$PFS_real,
+                                      plot_panel$gep70, 
+                                      method="spearman")$p.value, 3))
+ pan2 <- ggplot(plot_panel, aes(x=PFS_real, y=gep70)) +
+  geom_point(aes(color=gep70_class, shape=DiseaseStatus), size=point_size) + 
+ scale_color_manual(values=c("green", "blue", "red")) +
+  ggtitle("GEP70") + 
+  labs(y="") + xlab("PFS months") +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dotted") +
+  theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+  geom_hline(yintercept=gep70_cut_paper, linetype="dashed") +
+    geom_text(aes(label=newID, color=gep70_class), hjust=-0.5) +
+    ylim(0.50, max(plot_panel$gep70)) + xlim(0, 95) +
+   guides(color="none", shape="none")
+ 
+ pan2a <- ggplot(plot_panel[plot_panel$cohort==1, ], aes(x=PFS_real, y=gep70)) +
+  geom_point(aes(color=gep70_class, shape=DiseaseStatus), size=point_size) + 
+ scale_color_manual(values=c("green", "blue", "red")) +
+  ggtitle("GEP70") + 
+  labs(y="") + xlab("PFS months") +
+  geom_smooth(method=lm, se=FALSE, size=1,  color="black", linetype="dotted") +
+  theme_classic() +
+  theme(plot.title = element_text(size=title_size),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=12),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        aspect.ratio=1) +
+  geom_hline(yintercept=gep70_cut_paper, linetype="dashed") +
+    geom_text(aes(label=newID, color=gep70_class), hjust=-0.5) +
+    ylim(0.5, max(plot_panel$gep70)) + xlim(0, 10) +
+   guides(color="none", shape="none")
+```
+
+## KM plots  
+
+## mmSYGNAL cutoff = 0.5
+
+```{r km}
+scca_pheno %>%
+  dplyr::select(newID, PFS_real, relapse, mmSYGNAL, mmSYGNAL_class) %>%
+  dplyr::mutate(class=mmSYGNAL_class) %>%
+  dplyr::rename(risk=mmSYGNAL) %>%
+  dplyr::mutate(PFS_real=PFS_real/30) ->
+  km_pheno
+
+##################### 3 classes  ############################
+
+## KM plot
+cox_ia <- survfit(Surv(time=PFS_real, event=relapse)~ class, data=km_pheno)
+
+##ggsurvplot(cox_ia)
+
+## get log-rank test p-value
+lr_syg <- survdiff(Surv(time=PFS_real, event=relapse)~ class, data=km_pheno)
+syg_pval1 <- signif(broom::glance(lr_syg)$p.value, 3)
+
+## generate plot
+labs <- names(cox_ia$strata)
+labs <- str_remove(labs, "class=")
+tab <- cox_ia$strata
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2]), rep(labs[3], tab[3])))
+
+surv_df <- data.frame(SYGNAL_risk=plot_ind, 
+                      PFS=cox_ia$surv, 
+                      time=cox_ia$time)
+
+## get med PFS (50% survival)
+med_pfs <- summary(cox_ia)$table[,7]
+names(med_pfs) <- labs
+pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      SYGNAL_risk=names(med_pfs))
+
+## collect for full set of plots
+surv_pap <- surv_df
+surv_pap$method <- "mmSYGNAL"
+pfs_pap <- pfs_tab
+pfs_pap$method="mmSYGNAL"
+
+km1a <- ggplot(surv_df, aes(x=time, y=PFS, color=SYGNAL_risk)) + geom_point() + geom_step() +
+    scale_color_manual(values=c("red", "green", "blue")) +
+    theme_light() +
+    theme(legend.justification=c(1,1), legend.position=c(1,1),
+          legend.background=element_rect(fill="transparent"),
+           text=element_text(size=14),
+          legend.text = element_text(size=12)) + 
+    xlab("PFS (months)") + ylab("Survival probability") +
+    geom_hline(yintercept = 0.5, linetype="dotted") +
+    geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") + labs(color="risk") + 
+    annotate("text", x=35, y=0.9, label=paste("p-value:", syg_pval1), size=4) +
+    theme(aspect.ratio=4/4)
+ 
+print(km1a)
+
+## collect all km plot data
+surv_all <- surv_df
+surv_all$method <- "mmSYGNAL"
+
+pfs_all <- pfs_tab
+pfs_all$method <- "mmSYGNAL"
+
+pval_all <- data.frame(method="mmSYGNAL", pvalue=syg_pval1)
+
+ggsave(here("output/man_scca_km_extreme.pdf"), device="pdf")
+
+######################### split on 0.5 ###################
+
+## split on 0.5
+km_pheno %<>% dplyr::mutate(class=ifelse(km_pheno$risk <= 0.5, "low", "high")) 
+
+## KM plot
+cox_ia <- survfit(Surv(time=PFS_real, event=relapse)~ class, data=km_pheno)
+
+##ggsurvplot(cox_ia)
+
+## get log-rank test p-value
+lr_syg <- survdiff(Surv(time=PFS_real, event=relapse)~ class, data=km_pheno)
+syg_pval <- signif(broom::glance(lr_syg)$p.value, 3)
+
+## generate plot
+labs <- names(cox_ia$strata)
+labs <- str_remove(labs, "class=")
+tab <- cox_ia$strata
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2])))
+
+surv_df <- data.frame(SYGNAL_risk=plot_ind, 
+                      PFS=cox_ia$surv, 
+                      time=cox_ia$time)
+
+## get med PFS (50% survival)
+med_pfs <- summary(cox_ia)$table[,7]
+names(med_pfs) <- labs
+pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      SYGNAL_risk=names(med_pfs))
+
+km1 <- ggplot(surv_df, aes(x=time, y=PFS, color=SYGNAL_risk)) + geom_point() + geom_step() +
+    scale_color_manual(values=c("red", "blue")) +
+    theme(legend.justification=c(1,1), legend.position=c(1,1),
+          legend.background=element_rect(fill="transparent")) + 
+    xlab("PFS (months)") + ylab("survival probability") +
+    geom_hline(yintercept = 0.5, linetype="dotted") +
+    geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") + labs(color="mmSYGNAL risk") + 
+    annotate("text", x=30, y=0.9, label=paste("log-rank p-value:", syg_pval)) +
+    theme(aspect.ratio=4/4)
+ 
+print(km1)
+
+ggsave(here("output/scca_km.pdf"), device="pdf")
+
+
+```
+
+## GEP70  
+
+```{r km_gep70}
+
+scca_pheno %>%
+  dplyr::select(newID, PFS_real, relapse, gep70, gep70_class) %>%
+  dplyr::mutate(class=gep70_class) %>%
+  dplyr::rename(risk=gep70) %>%
+  dplyr::mutate(PFS_real=PFS_real/30) ->
+  km_pheno
+
+## KM plot
+cox_ia <- survfit(Surv(time=PFS_real, event=relapse)~ class, data=km_pheno)
+
+##ggsurvplot(cox_ia)
+
+## get log-rank test p-value
+lr_syg <- survdiff(Surv(time=PFS_real, event=relapse)~ class, data=km_pheno)
+gep70_pval <- signif(broom::glance(lr_syg)$p.value, 3)
+
+## generate plot
+labs <- names(cox_ia$strata)
+labs <- str_remove(labs, "class=")
+tab <- cox_ia$strata
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2])))
+
+surv_df <- data.frame(SYGNAL_risk=plot_ind, 
+                      PFS=cox_ia$surv, 
+                      time=cox_ia$time)
+
+## get med PFS (50% survival)
+med_pfs <- summary(cox_ia)$table[,7]
+names(med_pfs) <- labs
+pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      SYGNAL_risk=names(med_pfs))
+
+surv_tmp <- surv_df
+surv_tmp$method <- "GEP70"
+surv_pap <- rbind(surv_pap, surv_tmp)
+pfs_tmp <- pfs_tab
+pfs_tmp$method <- "GEP70"
+pfs_pap <- rbind(pfs_pap, pfs_tmp)
+
+kmgep70 <- ggplot(surv_df, aes(x=time, y=PFS, color=SYGNAL_risk)) + geom_point() + geom_step() +
+    scale_color_manual(values=c("red", "green", "blue")) +
+    theme(legend.justification=c(1,1), legend.position=c(1,1),
+          legend.background=element_rect(fill="transparent")) + 
+    xlab("PFS (months)") + ylab("survival probability") +
+    ggtitle("GEP70") +
+    geom_hline(yintercept = 0.5, linetype="dotted") +
+    geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") + labs(color="class") + 
+    annotate("text", x=40, y=0.9, label=paste("log-rank p-value:", syg_pval)) +
+    theme(aspect.ratio=4/4)
+ 
+print(kmgep70)
+
+```
+
+
+## SKY92  
+
+```{r km_sky92}
+
+scca_pheno %>%
+  dplyr::select(newID, PFS_real, relapse, sky92, sky92_class) %>%
+  dplyr::mutate(class=sky92_class) %>%
+  dplyr::rename(risk=sky92) %>%
+  dplyr::mutate(PFS_real=PFS_real/30) ->
+  km_pheno
+
+## KM plot
+cox_ia <- survfit(Surv(time=PFS_real, event=relapse)~ class, data=km_pheno)
+
+##ggsurvplot(cox_ia)
+
+## get log-rank test p-value
+sky92_pval <- NA
+
+surv_df <- data.frame(SYGNAL_risk=rep("high", length(cox_ia$surv)), 
+                      PFS=cox_ia$surv, 
+                      time=cox_ia$time)
+
+##  handcraft as there is only one curve. get med PFS (50% survival)
+pfs_tab <- data.frame(pfs=46.1, y1=0.5,
+                      y2=0,
+                      SYGNAL_risk="high")
+
+surv_tmp <- surv_df
+surv_tmp$method <- "SKY92"
+surv_pap <- rbind(surv_pap, surv_tmp)
+pfs_tmp <- pfs_tab
+pfs_tmp$method <- "SKY92"
+pfs_pap <- rbind(pfs_pap, pfs_tmp)
+
+kmsky92 <- ggplot(surv_df, aes(x=time, y=PFS, color=SYGNAL_risk)) + geom_point() + geom_step() +
+    scale_color_manual(values=c("red", "green", "blue")) +
+    theme(legend.justification=c(1,1), legend.position=c(1,1),
+          legend.background=element_rect(fill="transparent")) + 
+    xlab("PFS (months)") + ylab("survival probability") +
+    ggtitle("SKY92") +
+    geom_hline(yintercept = 0.5, linetype="dotted") +
+    geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") + labs(color="class") + 
+    annotate("text", x=40, y=0.9, label=paste("log-rank p-value:", sky92_pval)) +
+    theme(aspect.ratio=4/4)
+ 
+print(kmsky92)
+
+```
+
+
+## Cytogenetics  
+
+Cytogenetic class was based on whether a patient exhibited at least one high risk genetic abnormality. The high risk genetic abnormalities exhibited by at least one SCCA patient are amp(1q), t(4;14), del(17p), t(14;16).
+
+  
+```{r cyto_km}
+
+scca_pheno %>%
+  dplyr::mutate(PFS_real=PFS_real/30) %>%
+  dplyr::select(newID, PFS_real, relapse, cyto_count, cyto_class)->
+  cyto_pheno
+
+## add extreme risk patients
+cyto_pheno$cyto_class[cyto_pheno$cyto_count > 1] <- "extreme"
+
+## KM plot
+cox_ia <- survfit(Surv(time=PFS_real, event=relapse)~ cyto_class,
+                  data=cyto_pheno)
+
+## get log-rank test p-value
+lr_syg <- survdiff(Surv(time=PFS_real, event=relapse)~ cyto_class,
+                   data=cyto_pheno)
+cyto_pval <- signif(broom::glance(lr_syg)$p.value, 3)
+
+## generate plot
+labs <- names(cox_ia$strata)
+labs <- str_remove(labs, "cyto_class=")
+tab <- cox_ia$strata
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2]), rep(labs[3], tab[3])))
+
+surv_df <- data.frame(SYGNAL_risk=plot_ind, 
+                      PFS=cox_ia$surv, 
+                      time=cox_ia$time)
+
+## get med PFS (50% survival)
+med_pfs <- summary(cox_ia)$table[,7]
+names(med_pfs) <- labs
+pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      SYGNAL_risk=names(med_pfs))
+
+
+km2 <- ggplot(surv_df, aes(x=time, y=PFS, color=SYGNAL_risk)) + geom_point() + geom_step() +
+    scale_color_manual(values=c("red", "green", "blue")) +
+   theme_light() +
+   guides(color="none") +
+   theme(legend.justification=c(1,1), legend.position=c(1,1),
+          legend.background=element_rect(fill="transparent"),
+          text=element_text(size=14),
+          legend.text = element_text(size=12)) + 
+    xlab("PFS (months)") + ylab("Survival probability") +
+    geom_hline(yintercept = 0.5, linetype="dotted") +
+    geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") + labs(color="risk") + 
+    annotate("text", x=40, y=0.9, label=paste("p-value:", cyto_pval), size=4) +
+    theme(aspect.ratio=4/4)
+print(km2)
+ggsave(here("output/man_scca_km_cyto.pdf"), device="pdf")
+
+## collect all km plot data
+surv_cyto <- surv_df
+surv_cyto$method <- "cytogenetics"
+surv_all <- rbind(surv_all, surv_cyto)
+
+pfs_cyto <- pfs_tab
+pfs_cyto$method <- "cytogenetics"
+pfs_all <- rbind(pfs_all, pfs_cyto)
+
+pval_cyto <- data.frame(method="cytogenetics", pvalue=cyto_pval)
+pval_all <- rbind(pval_all, pval_cyto)
+```
+
+## International Staging System (ISS)  
+
+ISS has 3 stages, I, II, III, of increasing risk of disease progression.  
+
+  
+```{r iss_km}
+
+scca_pheno %>%
+  dplyr::mutate(PFS_real=PFS_real/30) %>%
+  dplyr::select(newID, PFS_real, relapse, Stage) ->
+  iss_pheno
+
+## KM plot
+cox_ia <- survfit(Surv(time=PFS_real, event=relapse)~ Stage,
+                  data=iss_pheno)
+
+## get log-rank test p-value
+lr_iss <- survdiff(Surv(time=PFS_real, event=relapse)~ Stage,
+                   data=iss_pheno)
+iss_pval <- signif(broom::glance(lr_iss)$p.value, 3)
+
+## generate plot
+labs <- names(cox_ia$strata)
+labs <- str_remove(labs, "Stage=")
+tab <- cox_ia$strata
+
+plot_ind <- factor(c(rep(labs[1], tab[1]), rep(labs[2], tab[2]),  rep(labs[3], tab[3])))
+
+surv_df <- data.frame(SYGNAL_risk=plot_ind, 
+                      PFS=cox_ia$surv, 
+                      time=cox_ia$time)
+
+## add a first time point
+surv_df <- rbind(data.frame(SYGNAL_risk="I", PFS=1, time=0), surv_df)
+
+## get med PFS (50% survival)
+med_pfs <- summary(cox_ia)$table[,7]
+names(med_pfs) <- labs
+pfs_tab <- data.frame(pfs=med_pfs, y1=rep(0.5, length(med_pfs)),
+                      y2=rep(0,length(med_pfs)),
+                      SYGNAL_risk=names(med_pfs))
+
+
+km3 <- ggplot(surv_df, aes(x=time, y=PFS, color=SYGNAL_risk)) + geom_point() + geom_step() +
+    scale_color_manual(values=c("blue", "green", "red"),
+                       labels=c("I", "II", "III")) +
+    ##theme(legend.justification=c(1,1), legend.position=c(1,1),
+    ##      legend.background=element_rect(fill="transparent")) + 
+    xlab("progression free survival (months)") + ylab("survival probability") +
+    ggtitle(paste("ISS risk")) +
+    geom_hline(yintercept = 0.5, linetype="dotted") +
+    geom_segment(data=pfs_tab, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") + labs(color="ISS risk") + 
+    annotate("text", x=40, y=0.9, label=paste("log-rank p-value:", iss_pval)) +
+    theme(aspect.ratio=4/4)
+print(km3)
+
+## collect all km plot data
+surv_iss <- surv_df
+surv_iss$method <- "ISS"
+surv_all <- rbind(surv_all, surv_iss)
+
+pfs_iss <- pfs_tab
+pfs_iss$method <- "ISS"
+pfs_all <- rbind(pfs_all, pfs_iss)
+
+pval_iss <- data.frame(method="ISS", pvalue=iss_pval)
+pval_all <- rbind(pval_all, pval_iss)
+```
+
+
+## KM all plots 
+
+```{r km_all}
+s_size <- 2
+pval_all$method <- fct_relevel(pval_all$method,"mmSYGNAL", "cytogenetics", "ISS")
+
+ ggplot(surv_all, aes(x=time, y=PFS)) + 
+   geom_step(aes(color=SYGNAL_risk)) + geom_point(aes(color=SYGNAL_risk)) +
+   scale_color_manual(values=c("red", "green", "blue", "blue", "green", "red")) +
+  facet_grid(.~fct_relevel(method, "mmSYGNAL", "cytogenetics", "ISS"), scales="fixed") +
+  ylab("survival probability") + xlab("PFS months") +
+    guides(color="none") +
+   ##theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+   theme(aspect.ratio=1:1) +
+   theme(axis.text = element_text(size = 8)) +
+    geom_segment(data=pfs_all, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") +
+   geom_hline(yintercept = 0.5, linetype="dotted") +
+   geom_text(data=pval_all, mapping=aes(x=60, y=0.9, label=paste("p-value:", pvalue)),
+             inherit.aes = FALSE, size=2) 
+ 
+ ggsave(here("output/man_scca_cyto_km_all.pdf"), device="pdf")
+ 
+ ## plot mmSYGNAL and cytogenetics
+ surv_mini <- surv_all %>% dplyr::filter(method != "ISS")
+ pfs_mini <- pfs_all %>% dplyr::filter(method != "ISS")
+ pval_mini <- pval_all %>% dplyr::filter(method != "ISS")
+ 
+ ggplot(surv_mini, aes(x=time, y=PFS)) + 
+   geom_step(aes(color=SYGNAL_risk)) + geom_point(aes(color=SYGNAL_risk)) +
+   scale_color_manual(values=c("red", "green", "blue"),
+                       labels=c("low", "high", "extreme")) +
+   theme_light() +
+  facet_grid(.~fct_relevel(method, "mmSYGNAL", "cytogenetics"), scales="fixed") +
+  ylab("survival probability") + xlab("PFS months") +
+    guides(color="none") +
+   theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+   theme(aspect.ratio=1:1) +
+   theme(axis.text = element_text(size = 8)) +
+    geom_segment(data=pfs_mini, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") +
+   geom_hline(yintercept = 0.5, linetype="dotted") +
+   geom_text(data=pval_mini, mapping=aes(x=60, y=0.9, label=paste("p-value:", pvalue)),
+             inherit.aes = FALSE, size=2.5)
+  ggsave(here("output/man_scca_cyto_km.pdf"), device="pdf")
+```
+
+## GEP KM all plots 
+
+```{r km_all_pap}
+s_size <- 2
+pval_pap <- data.frame(method=factor(c("mmSYGNAL", "GEP70", "SKY92")),
+                       pvalue=c(syg_pval1, gep70_pval, sky92_pval))
+
+ ggplot(surv_pap, aes(x=time, y=PFS)) + 
+   geom_step(aes(color=SYGNAL_risk)) + geom_point(aes(color=SYGNAL_risk)) +
+   scale_color_manual(values=c("red", "green", "blue"),
+                       labels=c("low", "high", "extreme")) +
+  facet_grid(.~fct_relevel(method, "mmSYGNAL", "GEP70", "SKY92"), scales="fixed") +
+  ylab("survival probability") + xlab("PFS months") +
+    guides(color="none") +
+   ##theme(strip.background = element_blank(), strip.text.x = element_blank()) +
+   theme(aspect.ratio=1:1) +
+   theme(axis.text = element_text(size = 8)) +
+    geom_segment(data=pfs_pap, mapping=aes(x=pfs, xend=pfs, y=y1, yend=y2),
+                 linetype="dashed") +
+   geom_hline(yintercept = 0.5, linetype="dotted") +
+   geom_text(data=pval_pap, mapping=aes(x=60, y=0.9, label=paste("p-value:", pvalue)),
+             inherit.aes = FALSE)
+ 
+ ggsave(here("output/man_km_paper_all.pdf"), device="pdf")
+```
+
+## ROC plots 
+
+Clinical outcome risk class is defined as high risk patients had a relapse in less than 3 years. All other patients are considered low risk.
+
+```{r roc, eval=TRUE}
+library(pROC)
+
+## Use PFS cutoff from GuanScore cutoff used in IA12. 30.2 is average monthe lengh
+plot_panel %<>%
+  dplyr::mutate(truth=ifelse(PFS_real <= 33.6*30.33 & relapse==TRUE, 1, 0)) 
+
+
+## GEP70
+### ROC plot
+rocc <- roc(response=plot_panel$truth, predictor=plot_panel$gep70, plot=FALSE,
+            direction="<")
+gep70_auc <- ia_auc <- signif(auc(rocc)[1],3)
+roc_dat <- data.frame(FPR=rev(1-rocc$specificities), TPR=rev(rocc$sensitivities))
+gep70_roc <- data.frame(roc_dat, method="GEP70")
+
+r70 <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 2, alpha = 0.7)+
+      labs(title= "GEP70", 
+           x = "False Positive Rate", 
+           y = "True Positive Rate") +
+           annotate('text', x=0.75, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=6) +
+           annotate('text', x=0.75, y=0.24, label=ia_auc, color="black", 
+                    fontface = 'bold', size=6) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme(plot.title = element_text(size = 12, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=15)) +
+    theme(aspect.ratio=4/4)
+
+## SKY92
+### ROC plot
+rocc <- roc(response=plot_panel$truth, predictor=plot_panel$sky92, plot=FALSE,
+            direction="<")
+sky92_auc <- ia_auc <- signif(auc(rocc)[1],3)
+roc_dat <- data.frame(FPR=rev(1-rocc$specificities), TPR=rev(rocc$sensitivities))
+sky92_roc <- data.frame(roc_dat, method="SKY92")
+
+r92 <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 2, alpha = 0.7)+
+      labs(title= "GEP70", 
+           x = "False Positive Rate", 
+           y = "True Positive Rate") +
+           annotate('text', x=0.75, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=6) +
+           annotate('text', x=0.75, y=0.24, label=ia_auc, color="black", 
+                    fontface = 'bold', size=6) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme(plot.title = element_text(size = 12, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=15)) +
+    theme(aspect.ratio=4/4)
+
+
+## mmSYGNAL
+km_pheno %<>%
+  dplyr::mutate(truth=ifelse(PFS_real <= 3*365 & relapse==TRUE, 1, 0)) 
+
+### ROC plot
+rocc <- roc(response=plot_panel$truth, predictor=plot_panel$risk, plot=FALSE,
+            direction="<")
+mm_auc <- ia_auc <- signif(auc(rocc)[1],3)
+roc_dat <- data.frame(FPR=rev(1-rocc$specificities), TPR=rev(rocc$sensitivities))
+mm_roc <- data.frame(roc_dat, method="mmSYGNAL")
+
+r1 <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 2, alpha = 0.7)+
+      labs(title= "mmSYGNAL", 
+           x = "False Positive Rate", 
+           y = "True Positive Rate") +
+           annotate('text', x=0.75, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=6) +
+           annotate('text', x=0.75, y=0.24, label=ia_auc, color="black", 
+                    fontface = 'bold', size=6) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme(plot.title = element_text(size = 12, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=15)) +
+    theme(aspect.ratio=4/4)
+
+
+## cytogenetics
+cyto_pheno %<>%
+  dplyr::mutate(truth=ifelse(PFS_real <= 3*365 & relapse==TRUE, 1, 0)) 
+
+### ROC plot
+rocc <- roc(response=cyto_pheno$truth, predictor=cyto_pheno$cyto_count, plot=FALSE,
+            direction="<")
+cyto_auc <- ia_auc <- signif(auc(rocc)[1],3)
+roc_dat <- data.frame(FPR=rev(1-rocc$specificities), TPR=rev(rocc$sensitivities))
+cyto_roc <- data.frame(roc_dat, method="cytogenetics")
+
+r2 <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 2, alpha = 0.7)+
+      labs(title= "Cytogenetics", 
+           x = "False Positive Rate", 
+           y = "True Positive Rate") +
+           annotate('text', x=0.75, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=6) +
+           annotate('text', x=0.75, y=0.24, label=ia_auc, color="black", 
+                    fontface = 'bold', size=6) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme(plot.title = element_text(size = 12, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=15)) +
+    theme(aspect.ratio=4/4)
+
+## ISS
+iss_pheno %>%
+  dplyr::mutate(truth=ifelse(PFS_real <= 3*365 & relapse==TRUE, 1, 0)) %>%
+  dplyr::mutate(ISS=as.numeric(plyr::mapvalues(Stage, from=c("III", "II", "I"), to=c(3,2,1))))->
+  iss_pheno
+
+### ROC plot
+rocc <- roc(response=iss_pheno$truth, predictor=iss_pheno$ISS, plot=FALSE,
+            direction="<")
+iss_auc <- ia_auc <- signif(auc(rocc)[1],3)
+roc_dat <- data.frame(FPR=rev(1-rocc$specificities), TPR=rev(rocc$sensitivities))
+iss_roc <- data.frame(roc_dat, method="ISS")
+
+r3 <- ggplot(roc_dat, aes(FPR, TPR)) + geom_line(size = 2, alpha = 0.7)+
+      labs(title= "ISS", 
+           x = "False Positive Rate", 
+           y = "True Positive Rate") +
+           annotate('text', x=0.75, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=6) +
+           annotate('text', x=0.75, y=0.24, label=ia_auc, color="black", 
+                    fontface = 'bold', size=6) +
+           geom_abline(slope=1, intercept=0, linetype="dashed") + 
+  theme(plot.title = element_text(size = 12, face = "bold"),
+    legend.title=element_text(size=12), 
+    legend.text=element_text(size=10)) +
+   theme(text = element_text(size=15)) +
+    theme(aspect.ratio=4/4)
+
+
+## mmSYGNAL and GEP panels
+roc_all <- rbind(mm_roc, gep70_roc, sky92_roc)
+auc_all <- data.frame(method=factor(c("mmSYGNAL", "GEP70", "SKY92"), ordered=TRUE), 
+                      auc=c(paste("mmSYGNAL", mm_auc), 
+                            paste("GEP70", gep70_auc), 
+                            paste("SKY92",sky92_auc)), 
+                      color=c("black", "orange", "purple"), y=c(0.25, 0.20, 0.15),
+                      x=rep(0.70))
+
+ggplot(roc_all, aes(FPR, TPR, color=method)) + geom_line(size = 2, alpha = 0.7)+
+      labs(x = "FPR", y = "TPR") +
+   scale_color_manual(values=c("orange", "black", "purple")) +
+           annotate('text', x=0.70, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=5) +
+   geom_text(data=auc_all, aes(label=auc, x=x, y=y), size=4) +
+   geom_abline(slope=1, intercept=0, linetype="dashed") + 
+   guides(color="none") +
+  theme(text = element_text(size=14)) +
+  theme(aspect.ratio=4/4) 
+ggsave(here("output/man_scca_ROC.pdf"), device="pdf")
+
+## mmSYGNAL and cyto, ISS
+roc_all <- rbind(mm_roc, cyto_roc, iss_roc)
+auc_all <- data.frame(method=factor(c("mmSYGNAL", "cytogenetics", "ISS"), ordered=TRUE), 
+                      auc=c(paste("mmSYGNAL", mm_auc), 
+                            paste("cyto", cyto_auc), 
+                            paste("ISS",iss_auc)), 
+                      color=c("blue", "green", "orange"), y=c(0.25, 0.20, 0.15),
+                      x=rep(0.70))
+
+ggplot(roc_all, aes(FPR, TPR, color=method)) + geom_line(size = 2, alpha = 0.7)+
+      labs(x = "FPR", y = "TPR") +
+   scale_color_manual(values=c("green", "orange", "blue")) +
+           annotate('text', x=0.70, y=0.30, label="AUC", color="black", 
+                    fontface = 'bold', size=5) +
+   geom_text(data=auc_all, aes(label=auc, x=x, y=y), size=4) +
+   geom_abline(slope=1, intercept=0, linetype="dashed") + 
+   guides(color="none") +
+  theme(text = element_text(size=14)) +
+  theme(aspect.ratio=4/4) 
+```
+

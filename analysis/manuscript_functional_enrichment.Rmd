@@ -1,0 +1,834 @@
+---
+title: "Manuscript functional enrichment program activity"
+author: "Carl Murie"
+date: '`r format(Sys.Date(), "%B %d %Y")`'
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE)
+```
+
+
+```{r libs}
+library(knitr)
+library(here)
+library(readr)
+library(tidyverse)
+library(magrittr)
+library(stringr)
+library(tibble)
+library(data.table)
+library(ggplot2)
+library(kableExtra)
+library(RNASeqUtilities)
+library(pROC)
+library(gridExtra)
+library(survival)
+library(scales)
+library(eply)
+library(jsonlite)
+library(ComplexHeatmap)
+library(caret)
+library(parallel)
+library(DT)
+library(survminer)
+library(viridis)
+
+source(here("code/cluster_enrichment.R"))
+source(here("code/utilities.R"))
+```
+
+```{r data}
+##d1 <-  read_csv(here("output/drugs/drugs_complete.csv"))
+
+## drugs mapping to all regulons
+mm_drug <- read_csv(here("data/drug_map_me_to_patient_v3.csv"))
+num_drugs <- length(unique(mm_drug$Drug))
+
+mm_drug %>% dplyr::filter(RegulatorTarget==TRUE) -> mm_targ
+num_targs <- length(unique(mm_targ$Drug))
+
+mm_drug %>%
+  dplyr::filter(Drug=="CARFILZOMIB") ->
+  tmp
+
+## drug targets mapping to disease relevant regulons 
+drugs <- read_csv(here("data/drug_complete_disease_relevant.csv"))
+prog_drugs <- NULL
+for(i in 1:nrow(drugs)) {
+  d <- drugs[i,]
+     targs <- unlist(str_split(drugs[i,]$DrugTargetAll, pattern=","))
+    prog_drugs <-  rbind(prog_drugs, data.frame(drug=d$Drug, target=targs, disease=d$TargetDisease, SOC=d$soc, RR=d$rr, PhaseIVCancer=d$ifCancerPhaseIV, MMPhase=d$Phase_MM))
+}
+prog_drugs <- dplyr::distinct(prog_drugs)
+
+## causal flows
+causal <- read_tsv(here("data/filteredCausalResults_expanded.txt"))
+
+## read in gene expression
+ia12 <- read_csv(here("data/IA12Zscore_filtered.csv"))
+colnames(ia12)[1] <- "gene"
+
+## read in subtype and risk info and ensure it is ordered by risk (low to high)
+mm_risk <- read_csv(here("data/decision_tree_risk.csv")) 
+mm_prog <- read_csv(here("data/program_activity_IA12_py.csv"))
+
+mm_act <- data.frame(sample=mm_risk$sample, t(mm_prog[,mm_risk$sample]))
+colnames(mm_act) <- c("sample", paste0("P-", mm_prog$program))
+rownames(mm_act) <- NULL
+mm_act %<>% dplyr::left_join(mm_risk, by="sample") 
+
+## sort gene expression by risk
+ia12_sort <- data.frame(gene=ia12$gene, ia12[,mm_risk$sample])
+
+## GSE19784  
+read_csv(here("data/validation/GSE19784_RNA_pheno.csv")) %>%
+  dplyr::arrange(desc(GuanScore)) ->
+  gse1_risk
+gse1_prog <- t(read_csv(here("data/validation/GSE19784_minernorm_program.csv")))
+colnames(gse1_prog) <- paste0("P-", gse1_prog[1,])
+gse1_prog <- as.data.frame(gse1_prog[-1,])
+gse1_prog$sample <- rownames(gse1_prog)
+gse1_prog %<>% dplyr::left_join(gse1_risk, by="sample") 
+
+## GSE24080  
+read_csv(here("data/validation/GSE24080_RNA_pheno.csv")) %>%
+  dplyr::arrange(desc(GuanScore)) ->
+  gse2_risk
+gse2_prog <- t(read_csv(here("data/validation/GSE24080_minernorm_program.csv")))
+colnames(gse2_prog) <- paste0("P-", gse2_prog[1,])
+gse2_prog <- as.data.frame(gse2_prog[-1,])
+gse2_prog$sample <- rownames(gse2_prog)
+gse2_prog %<>% dplyr::left_join(gse2_risk, by="sample") 
+
+## get program/regulon definitions
+prog_regs <- fromJSON(here("data/transcriptional_programs.json"))
+regulons <- fromJSON(here("data/regulons.json"))
+risk_prog <- read_csv(here("data/risk_prediction_program_frequency.csv"))
+
+prog_sym <- read_csv(here("data/program_definition_full.csv"))
+reg_sym <-  read_csv(here("data/regulon_definition.csv"))
+prog_sym %>%
+  dplyr::filter(prog_sym$program %in% risk_prog$program) ->
+  risky
+
+prog_sym %>%
+   dplyr::select(program, regulon) %>%
+   dplyr::distinct() %>%
+   dplyr::filter(program %in% risk_prog$program)->
+prog_regs
+
+
+## get ensembl symbol mappings  
+read_tsv(here("data/identifier_mappings.txt")) %>%  
+  dplyr::filter(Source=="Gene Name") %>%  
+  dplyr::select(-Source) ->  
+  syms  
+
+prog_sym %>% 
+  dplyr::select(program, regulator) %>% 
+  dplyr::left_join(syms, by=c("regulator"="Preferred_Name")) %>%
+  dplyr::rename(SYMBOL=Name)->  
+  prog_regulators 
+
+prog_regulators %>%
+  dplyr::select(regulator, SYMBOL) %>%
+  dplyr::distinct() ->
+reg_defs
+  
+reg_defs %>%
+  dplyr::rename(Reg_SYMBOL=SYMBOL) %>%
+  dplyr::right_join(prog_sym, by="regulator") %>%
+  dplyr::select(program, regulon, regulator, Reg_SYMBOL, gene, SYMBOL) ->
+  full_def
+write_csv(full_def, here("data/prog_def_full_regs.csv"))
+
+## test data
+gse1_dat <- read_csv(here("data/validation/GSE19784_RNASeq.csv")) 
+gse1_dat %>%
+  dplyr::filter(Gene %in% syms$Preferred_Name) %>%
+  dplyr::left_join(syms, by=c("Gene"="Preferred_Name")) %>%
+  dplyr::mutate(SYMBOL=Name) %>%
+  dplyr::select(Gene, SYMBOL, everything(), -Name)  ->
+  gse1_genes
+
+gse1_genes <- data.frame(gse1_genes[,1:2], gse1_genes[,gse1_risk$sample])
+
+gse2_dat <- read_csv(here("data/validation/GSE24080_RNASeq.csv"))
+gse2_dat %>%
+  dplyr::filter(Gene %in% syms$Preferred_Name) %>%
+  dplyr::left_join(syms, by=c("Gene"="Preferred_Name")) %>%
+  dplyr::mutate(SYMBOL=Name) %>%
+  dplyr::select(Gene, SYMBOL, everything(), -Name)->
+  gse2_genes
+
+gse2_genes <- data.frame(gse2_genes[,1:2], gse2_genes[,gse2_risk$sample])
+  
+subtypes <- c("all", "del13", "del1p", "amp1q", "FGFR3", "WHSC1")
+subdirs <-  c("all", "del13", "del1p", "amp1q", "FGFR3", "t414")
+sublabs <-  c("all", "del13", "del1p", "amp1q", "FGFR3", "t(4;14)")
+sub_pretty <- c("agnostic", "del(13)", "del(1p)", "amp(1q)", "FGFR3", "t(4;14)")
+
+## regulon enrichments
+fun_tab <- readRDS(here("data/mm_regulons_functional_enrichment_risk_table.RDS"))
+
+getRegEnrich <- function(reg, listy=fun_tab) {
+  
+  outie <- NULL
+  for(n in names(listy)) {
+    listy[[n]] %>%
+      dplyr::filter(regulon==reg) ->
+      tmp
+    if(nrow(tmp) > 0) {
+      tmp$db <- n
+      outie <- rbind(outie, tmp)
+    }
+  }
+  return(outie)
+}
+
+
+```
+
+```{r genes}
+
+genies <- regulators <- list()
+for(prog in as.character(unique(prog_sym$program))) {
+  prog_sym %>%
+    dplyr::filter(program==prog) ->
+    genes
+  
+  regulators[[prog]] <- unique(genes$regulator) 
+  
+  genes %>%
+    dplyr::select(gene, SYMBOL) %>%
+    dplyr::distinct() ->
+    genes1
+  genies[[prog]] <- genes1
+}
+```
+
+
+```{r countme}
+
+clin <- read_csv(here("data/globalClinTraining.csv"))
+
+age_seq <- seq(25, 95, 10)
+age_lab <- c("25-35", "35-45", "45-55", "55-65", "65-75", "75-85", "85-95")
+clin$Age <- findInterval(clin$D_Age, age_seq)
+
+## IA12
+ia_cols <- str_sub(mm_risk$sample, start=1, end=9)
+clin %>%
+  dplyr::filter(Study=="MMRF") %>%
+  dplyr::filter(Patient %in% ia_cols) ->
+ia 
+
+ia_tab <- as.data.frame(table(ia[,c("Age", "D_Gender")]))
+ia_new <- data.frame(Age=age_lab, Female=ia_tab$Freq[1:7], Male=ia_tab$Freq[8:14])
+
+## GSE19768
+gse1_cols <- gse1_risk$sample ##str_sub(mm_risk$sample, start=1, end=9)
+clin %>%
+  dplyr::filter(Study=="HOVON65") %>%
+  dplyr::filter(Patient %in% gse1_cols) ->
+gse1 
+
+gse1_tab <- as.data.frame(table(gse1[,c("Age", "D_Gender")]))
+gse1_new <- data.frame(Age=age_lab[1:5], Female=gse1_tab$Freq[1:5], Male=gse1_tab$Freq[6:10])
+gse1_new <- rbind(gse1_new, data.frame(Age=age_lab[6:7], Female=c(0,0), Male=c(0,0)))
+
+## GSE24080  
+gse2_cols <- gse2_risk$sample ##str_sub(mm_risk$sample, start=1, end=9)
+clin %>%
+  dplyr::filter(Study=="GSE24080UAMS") %>%
+  dplyr::filter(Patient %in% gse2_cols) ->
+gse2 
+
+gse2_tab <- as.data.frame(table(gse2[,c("Age", "D_Gender")]))
+gse2_new <- data.frame(Age=age_lab[1:5], Female=gse2_tab$Freq[1:5], Male=gse2_tab$Freq[6:10])
+gse2_new <-  data.frame(Age=age_lab, Female=gse2_tab$Freq[1:7], Male=gse2_tab$Freq[8:14])
+
+
+all_tab <- cbind(ia_new, gse1_new[,-1], gse2_new[,-1])
+
+write_csv(all_tab, here("output/demographics_data.csv"))
+
+```
+
+`r headerKable(all_tab) %>% add_header_above(c("", "IA12"=2, "GSE19768"=2, "GSE24080"=2))`
+
+# **Significant programs (coefficients) for risk prediction**
+
+```{r risky}
+## Collect significant programs for each risk prediction model
+train_coefs <-all_coefs <- sub_progs <- progs_df <- NULL
+imps <- data.frame(program=0:140)
+for(i in 1:length(subtypes)) {
+   out_path <- paste0(here("data/risk_models"),"/")
+   tmp <-  readRDS(paste0(out_path, sublabs[i], "_risk_elastic_net.Rds"))
+   model <- tmp[[1]]
+   coefs <- coef(model$finalModel, model$bestTune$lambda)[-1,1]
+   coefs_sig <- sort(coefs[coefs > 0], decreasing = TRUE)
+   names(coefs_sig) <- parse_number(as.character(names(coefs_sig)))
+   
+   ## get list of programs for each subtype
+   sub_progs[[subtypes[[i]]]] <- sort(as.numeric(names(coefs_sig)))
+   
+   train_coefs[[sublabs[i]]] <- coefs_sig
+   all_coefs <- c(all_coefs, names(coefs_sig))
+   
+   ## put train_coefs into data.frame format
+   progs_df[[sublabs[i]]] <- data.frame(program=names(coefs_sig), coefs=coefs_sig)
+   
+   ## get importance values for each significant variable
+   impy<- varImp(model)$importance
+   x <- as.numeric(str_replace_all(noquote(rownames(impy)), "`", ""))
+   imp_df <- data.frame(program=x, importance=impy$Overall)
+   colnames(imp_df)[2] <- subtypes[i]
+   imps %<>% dplyr::left_join(imp_df)
+}
+
+coef_tab <- data.frame(sort(table(all_coefs), decreasing=TRUE))
+colnames(coef_tab) <- c("program", "count")
+
+write_csv(imps, here("output/risk_prediction_importance_scores.csv"))
+write_csv(coef_tab, here("output/risk_prediction_program_frequency.csv"))
+saveRDS(train_coefs, here("output/risk_prediction_subtype_programs.Rds"))
+```
+  
+`r headerKable(coef_tab, title="count of significant programs")`  
+
+```{r venn}
+library(venn)
+names(sub_progs) <- sub_pretty
+
+for(i in 1:length(sub_progs)) {
+   cat(names(sub_progs)[i], "\n", sub_progs[[i]], "\n\n")
+}
+
+
+venn(sub_progs, sncs=1, ilcs=1.5, zcolor="style")
+
+pdf(file=here("output/importance_venn.pdf"))
+venn(sub_progs, sncs=1, ilcs=1.5, zcolor="style")
+dev.off()  
+```
+  
+## Coefficients  
+  
+```{r mappy}
+
+mappy <- data.frame(program=sort(coef_tab$program))
+for(i in names(progs_df)) {
+   tmpy <- progs_df[[i]] 
+   colnames(tmpy)[2] <- i   
+   mappy %<>% dplyr::left_join(tmpy)  
+}
+
+colnames(mappy) <- c("program", sub_pretty)
+mappy[is.na(mappy)] <- 0
+out_map <- as.matrix(mappy[,-1])
+rownames(out_map) <- mappy$program
+
+library(circlize)
+maxi <- max(out_map)
+col_fun = colorRamp2(c(maxi, 0), c("red", "white"))
+nothing <- col_fun(seq(maxi, 0, length.out=20))
+
+hm_bin <- Heatmap(out_map, 
+                  rect_gp = gpar(col = "black", lwd = 0.5),
+                    column_title="", 
+                    row_title="",
+                    cluster_rows=TRUE, 
+                    cluster_columns=TRUE,
+                    show_column_names=TRUE,
+                    row_gap=unit(0.1, "mm"),
+                    ##height = unit(5, "mm")*nrow(out_map),
+                    width=unit(5, "mm")*ncol(out_map),
+                    ##heatmap_height = unit(2.5, "mm")*nrow(out_map),
+                    col=col_fun,
+                    row_names_gp = gpar(fontsize = 7.5),
+                    heatmap_legend_param=list(direction="horizontal",
+                                              title="Coefficients")) 
+  draw(hm_bin, heatmap_legend_side="right", annotation_legend_side="right")    
+
+```
+    
+  
+## Importance  
+
+Elastic net: scaled (0,1) absolute value of the coefficients
+  
+```{r importance}
+imps %>% dplyr::filter(program %in% mappy$program) -> imp_out
+colnames(imp_out) <- c("program", sub_pretty)
+
+out_map1 <- as.matrix(imp_out[,-1])
+rownames(out_map1) <- imp_out$program
+
+maxi <- max(out_map1, na.rm=TRUE)
+col_fun = colorRamp2(c(maxi, 0), c("red", "white"))
+nothing <- col_fun(seq(maxi, 0, length.out=20))
+
+hm_bin <- Heatmap(out_map1, 
+                   rect_gp = gpar(col = "black", lwd = 0.5),
+                    column_title="", 
+                    row_title="",
+                    cluster_rows=TRUE, 
+                    cluster_columns=TRUE,
+                    show_column_names=TRUE,
+                    row_gap=unit(0.1, "mm"),
+                    ##height = unit(5, "mm")*nrow(out_map),
+                    width=unit(5, "mm")*ncol(out_map),
+                    ##heatmap_height = unit(2.7, "mm")*nrow(out_map),
+                    col=col_fun,
+                    row_names_gp = gpar(fontsize = 7.5),
+                    heatmap_legend_param=list(direction="horizontal",
+                                              title="Importance")) 
+  draw(hm_bin, heatmap_legend_side="right", annotation_legend_side="right")  
+  
+  pdf(file=here("output/importance_heat.pdf"))
+  
+  draw(hm_bin, heatmap_legend_side="right", annotation_legend_side="right")  
+  dev.off()
+  
+prog_ord <- rownames(out_map1)[row_order(hm_bin)]
+```
+  
+  
+
+```{r sig_regs}
+
+db_names <- c("hallmarks_cancer", "immunology", "oncogenetics", "curated1", "curated2", "GO",
+              "KEGG", "reactome")
+
+funct <- readRDS(here("output/slurm_programs_functional_enrichment.RDS"))
+react <- readRDS(here("output/programs_functional_enrichment_risk_reactome.RDS"))
+
+## condense reactome
+all_react <- NULL
+for(i in names(react)) {
+   tmp <- react[[i]] %>%
+    dplyr::filter(Count > 1) ->
+    tmp
+   if(nrow(tmp) > 0) {
+     tmp %<>% dplyr::filter(Count > 1) 
+      all_react <- rbind(all_react, data.frame( program=i, db="reactome", react[[i]]))  
+   }
+}
+
+## reformat in inefficient fashion
+all_out <- list()
+all_db <- NULL 
+all_byDB <- vector("list", length(db_names))
+for(i in names(funct)) {
+  tmp <- funct[[i]]
+  tmpy <- NULL
+  for(j in 1:length(tmp)) {
+    if(nrow(tmp[[j]] > 0)) {
+        tmp[[j]]  %>%
+           dplyr::filter(Count > 1)-> 
+        tmp1
+      if(nrow(tmp1) > 0) {
+          dbb <- names(tmp)[j]
+           rownames(tmp1) <- NULL
+           tmpy <-rbind(tmpy, data.frame(program=i, db=dbb, tmp1))
+          ##tmpy <-rbind(tmpy, tmp1)
+           ## store enrichments by database
+           all_byDB[[j]] <- rbind(all_byDB[[j]], data.frame(program=i,  db=dbb, tmp1))
+      }
+    } 
+  }
+  
+  if(nrow(react[[i]]) > 0) {
+     tmp2 <- data.frame(program=i, db="reactome", react[[i]])
+     rownames(tmp2) <- NULL
+    tmpy <- rbind(tmpy, tmp2)
+  }
+  all_out[[i]] <- tmpy
+}
+   
+all_byDB[[8]] <- all_react 
+
+names(all_byDB) <- db_names 
+saveRDS(all_byDB, file=here("output/program_functional_enrichment_risk_byDB.RDS"))
+saveRDS(all_out, file=here("output/program_functional_enrichment_risk_table.RDS"))
+
+all_db <- as.data.frame(do.call(rbind, all_out))
+all_db$program <- paste0("P-", all_db$program) 
+rownames(all_db) <- NULL
+
+```
+  
+  
+```{r sig_regs_regulators}
+
+db_names <- c("hallmarks_cancer", "immunology", "oncogenetics", "curated1", "curated2", "GO",
+              "KEGG", "reactome")
+
+funct_reg <- readRDS(here("output/slurm_programs_regulator_functional_enrichment.RDS"))
+react_reg <- readRDS(here("output/slurm_programs_regulator_functional_enrichment_reactome.RDS"))
+
+## condense reactome
+all_react_reg <- NULL
+for(i in names(react_reg)) {
+   tmp <- react_reg[[i]] %>%
+    dplyr::filter(Count > 1) ->
+    tmp
+   if(nrow(tmp) > 0) {
+     tmp %<>% dplyr::filter(Count > 1) 
+      all_react_reg <- rbind(all_react_reg, data.frame( program=i, db="reactome", react_reg[[i]]))  
+   }
+}
+
+## reformat in inefficient fashion
+all_out_reg <- list()
+all_byDB_reg <- vector("list", length(db_names))
+for(i in names(funct_reg)) {
+  tmp <- funct_reg[[i]]
+  tmpy <- NULL
+  for(j in 1:length(tmp)) {
+    if(nrow(tmp[[j]] > 0)) {
+        tmp[[j]]  %>%
+           dplyr::filter(Count > 1)-> 
+        tmp1
+      if(nrow(tmp1) > 0) {
+           dbb <- names(tmp)[j]
+           rownames(tmp1) <- NULL
+           tmpy <-rbind(tmpy, data.frame(program=i, db=dbb, tmp1))
+           ## store enrichments by database
+           all_byDB_reg[[j]] <- rbind(all_byDB_reg[[j]],  data.frame(program=i, db=dbb, tmp1))
+      }
+    } 
+  }
+  if(nrow(react_reg[[i]]) > 0) {
+     tmp2 <- data.frame(program=i, db="reactome", react_reg[[i]])
+     rownames(tmp2) <- NULL
+    tmpy <- rbind(tmpy, tmp2)
+  }
+ 
+  all_out_reg[[i]] <- tmpy
+}
+   
+all_byDB_reg[[8]] <- all_react_reg 
+
+names(all_byDB_reg) <- db_names 
+saveRDS(all_byDB_reg, file=here("output/program_regulator_functional_enrichment_risk_byDB.RDS"))
+saveRDS(all_out_reg, file=here("output/program_regulator_functional_enrichment_risk_table.RDS"))
+  
+
+all_db_reg <- as.data.frame(do.call(rbind, all_out_reg))
+all_db_reg$program <- paste0("P-", all_db_reg$program)
+rownames(all_db_reg) <- NULL
+```  
+  
+# Functional Enrichment of Programs  {.tabset .tabset-pills} 
+
+List of multiple myeloma pathways (NDEx)  
+https://www.ndexbio.org/#/networkset/85034b42-de8a-11ea-99da-0ac135e8bacf
+
+Functional enrichment is based on program genes. Enrichment categories that contained only one gene from the program were removed.
+
+```{r react}
+
+data.frame(program=names(all_out), count=unlist(lapply(all_out, nrow))) %>%
+  dplyr::arrange(desc(count)) ->
+  counts
+
+data.frame(program=names(all_out_reg), count=unlist(lapply(all_out_reg, nrow))) %>%
+  dplyr::arrange(desc(count)) ->
+  counts_reg
+
+rownames(counts) <- rownames(counts_reg) <- NULL
+
+tabby <- data.frame(program=names(all_out))
+for(n in names(all_byDB)) {
+  tab <- as.data.frame(table(all_byDB[[n]]$program))
+  tab$Var1 <- as.character(tab$Var1)
+  colnames(tab) <- c("program", n)
+  tabby <- tabby %<>%  dplyr::left_join(tab, by="program") 
+}
+
+tabby_reg <- data.frame(program=names(all_out_reg))
+for(n in names(all_byDB_reg)) {
+  tab <- as.data.frame(table(all_byDB_reg[[n]]$program))
+  tab$Var1 <- as.character(tab$Var1)
+  colnames(tab) <- c("program", n)
+  tabby_reg <- tabby_reg %<>%  dplyr::left_join(tab, by="program") 
+}
+
+```
+  
+
+## Enrichments by program  
+
+`r headerKable(counts, title="Counts of functional enrichments by program")`
+
+## Enrichments by program regulons
+
+`r headerKable(counts_reg, title="Counts of functional enrichments by program regulons")`
+
+## Program enrichments by database  
+
+`r headerKable(tabby, title="Counts of functional enrichments by database")`
+
+## Program regulator enrichments by database  
+
+`r headerKable(tabby_reg, title="Counts of functional enrichments by database")`
+
+
+# Risk association of programs 
+  
+```{r risky_progs}
+
+mm_tmp <- mm_act
+imp_subs <- data.frame(subtypes=colnames(imp_out)[-1],
+                       sub_labs=c("all", "del13", "del1p", "amp1q", "FGFR3", "WHSC1"))
+
+surv_list <- gse_list <- surv_pvals <- NULL
+for (i in 1:nrow(imp_subs)) {
+  sub <- imp_subs[i, "subtypes"]
+  sub_lab <- imp_subs[i, "sub_labs"]
+  imp_out %>%
+    dplyr::select(program, sub) %>%
+    dplyr::filter(!!as.name(sub) > 0) %>%
+    dplyr::arrange(desc(!!as.name(sub))) ->
+    sub_proggs
+    
+  ## ia12 data
+  subsurv_tmp <- NULL
+  for(proggy in sub_proggs$program) { 
+      proggy1 <- paste0("P-", proggy) 
+      sub_proggs %>% dplyr::filter(program==proggy) -> imp_tmp
+      mm_act %>%
+        dplyr::mutate(program=!!as.name(proggy1)) %>% 
+        dplyr::filter(!!as.name(sub_lab)==1) %>% 
+        dplyr::select(PFS, D_PFS_FLAG, program) ->  
+      mm_tmp
+     
+      survy <- survfit(Surv(time=PFS, event=D_PFS_FLAG)~program, data=mm_tmp)
+      pvall <- survdiff(Surv(time=PFS, event=D_PFS_FLAG)~program, data=mm_tmp)
+      pval <- broom::glance(pvall)$p.value
+      
+      res <- summary(coxph(Surv(PFS, D_PFS_FLAG) ~ program, data = mm_tmp))
+      ret <- c(HR=res$coefficients[2], pvalue=res$coefficients[5])
+      ## plot(survy, pvalue=TRUE)
+      ##print(cat(pval, "\t", surv_pvalue(survy)$pval.txt, "\n"))
+      surv_pvals <- rbind(surv_pvals, data.frame(subtype=sub, program=proggy1, pvalue=pval,
+                                                 coxHR=ret[1]))
+
+      surv_sum <- summary(survy)$table[,"median"]
+      if(length(surv_sum) < 3) {
+          if(sum(names(surv_sum) == "program=-1")==0) {
+             meds <- data.frame("program=-1"=NA, "program=0"=surv_sum[1],
+                                  "program=1"=surv_sum[2])
+          }
+      } else {
+         meds <- data.frame(t(surv_sum)) 
+      }
+      names(meds) <- c("under", "neutral", "over")
+      meds_tmp <- data.frame(subtype=sub, program=proggy1, importance=signif(imp_tmp[1,2], 3),
+                             meds)
+      subsurv_tmp <- rbind(subsurv_tmp, meds_tmp)
+  } ## end for proggy 
+   surv_list <- rbind(surv_list, subsurv_tmp)
+   
+   ## analyse GSE data
+   if(sub=="agnostic" | sub=="t(4;14)") {
+   
+      ## GSE110784  
+      subsurv_tmp <- NULL
+      for(proggy in sub_proggs$program) { 
+          proggy1 <- paste0("P-", proggy) 
+          sub_proggs %>% dplyr::filter(program==proggy) -> imp_tmp
+          gse1_prog %>%
+            dplyr::mutate(program=!!as.name(proggy1)) %>% 
+            dplyr::filter(!!as.name(sub_lab)==1) %>% 
+            dplyr::select(PFS, D_PFS_FLAG, program) ->  
+          gse1_tmp
+         
+          survy <- survfit(Surv(time=PFS, event=D_PFS_FLAG)~program, data=gse1_tmp)
+          if(!is.null(dim(summary(survy)$table))) {
+              surv_sum <- summary(survy)$table[,"median"]
+              
+              ##print(surv_sum)
+              if(length(surv_sum) < 3) {
+                  if(sum(names(surv_sum) == "program=-1")==0) {
+                     meds <- data.frame("program=-1"=NA, "program=0"=surv_sum[1],
+                                          "program=1"=surv_sum[2])
+                  }
+              } else {
+                 meds <- data.frame(t(surv_sum)) 
+              }
+              names(meds) <- c("under", "neutral", "over")
+              meds_tmp <- data.frame(data="GSE19784", subtype=sub, program=proggy1, 
+                                     importance=signif(imp_tmp[1,2], 3), meds)
+              subsurv_tmp <- rbind(subsurv_tmp, meds_tmp)
+          }
+      } ## end for proggy
+      gse_list <- rbind(gse_list, subsurv_tmp)
+   
+       ## GSE24080  
+      
+      for(proggy in sub_proggs$program) { 
+          proggy1 <- paste0("P-", proggy) 
+          sub_proggs %>% dplyr::filter(program==proggy) -> imp_tmp
+          gse2_prog %>%
+            dplyr::mutate(program=!!as.name(proggy1)) %>% 
+            dplyr::filter(!!as.name(sub_lab)==1) %>% 
+            dplyr::select(PFS, D_PFS_FLAG, program) ->  
+          gse2_tmp
+         
+          survy <- survfit(Surv(time=PFS, event=D_PFS_FLAG)~program, data=gse2_tmp)
+          if(!is.null(dim(summary(survy)$table))) {
+              surv_sum <- summary(survy)$table[,"median"]
+              ##print(surv_sum)
+              if(length(surv_sum) < 3) {
+                  if(sum(names(surv_sum) == "program=-1")==0) {
+                     meds <- data.frame("program=-1"=NA, "program=0"=surv_sum[1],
+                                          "program=1"=surv_sum[2])
+                  }
+              } else {
+                 meds <- data.frame(t(surv_sum)) 
+              }
+              names(meds) <- c("under", "neutral", "over")
+              meds_tmp <- data.frame(data="GSE24080", subtype=sub, program=proggy1, 
+                                     importance=signif(imp_tmp[1,2], 3), meds)
+              subsurv_tmp <- rbind(subsurv_tmp, meds_tmp)
+          }
+      } ## end for proggy
+      gse_list <- rbind(gse_list, subsurv_tmp)
+   }
+} ## for i
+rownames(surv_list) <- rownames(gse_list) <- NULL
+
+```
+  
+## Boxplot summary 
+  
+```{r plotty} 
+## IA12 data
+surv_df <- data.table::melt(data.table(surv_list), measure.vars=c("under", "neutral", "over"))
+ggplot(surv_df, aes(x=variable, y=value)) + geom_boxplot(aes(fill=variable)) +
+  facet_wrap(~subtype) + xlab("activity") + ylab("50% PFS (months)") +
+  ggtitle("Risk stratifying programs")
+
+## GSE data
+surv_df <- data.table::melt(data.table(gse_list), measure.vars=c("under", "neutral", "over"))
+ggplot(surv_df, aes(x=variable, y=value)) + geom_boxplot(aes(fill=variable)) +
+  facet_wrap(~data+subtype) + xlab("activity") + ylab("50% PFS (months)") +
+  ggtitle("Risk stratifying programs")
+
+```
+  
+## Heatmap 50% PFS summary 
+
+```{r heat_fulll}
+
+all_subs <- unique(surv_list$subtype)
+
+pfs_under <- pfs_over <- data.frame(program=sort(unique(surv_list$program)))
+for(p in all_subs) {
+  surv_list %>% dplyr::filter(subtype==p) -> tmp
+ 
+  pfs_under %<>%
+    dplyr::left_join(tmp[,c("program", "under")], by="program") 
+  
+  pfs_over %<>%
+    dplyr::left_join(tmp[,c("program", "over")], by="program") 
+  
+}
+
+colnames(pfs_under) <- colnames(pfs_over) <- c("program", all_subs)
+
+pfs_underover <- t(as.matrix(cbind(pfs_under[-1], pfs_over[,-1])))
+colnames(pfs_underover) <- pfs_under$program
+
+maxi <- max(meds[,-1], na.rm=TRUE)
+mini <- min(meds[,-1], na.rm=TRUE)
+col_fun = colorRamp2(c(mini, maxi), c("purple", "white"))
+col_fun = colorRamp2(c(mini, maxi), c("blue", "yellow"))
+
+pfs_underover[is.na(pfs_underover)] <- maxi
+
+hm_bin_auc <- Heatmap(pfs_underover, 
+                  rect_gp = gpar(col = "black", lwd = 0.5),
+                  column_title="50% PFS survival by activity", 
+                  cluster_rows=FALSE, 
+                  cluster_columns=TRUE,
+                  show_column_names=TRUE, 
+                  heatmap_legend_param=list(direction="horizontal", 
+                                        title=""), 
+                  show_heatmap_legend = TRUE,
+                  col=col_fun,
+                  column_title_rot = 0,
+                  row_split = c(rep("under", 6), 
+                                rep("over", 6)),
+                  row_names_gp = gpar(fontsize = 9.5),
+                  column_names_gp = gpar(fontsize = 8.5),
+                  width=unit(2, "mm")*ncol(pfs_underover),
+                  height=unit(5, "mm")*nrow(pfs_underover),
+                  na_col="white",
+                  column_names_rot=45
+                  ##row_gap=unit(0.2, "mm"),
+                  ##row_names_gp=gpar(fontsize=6)
+)
+                  
+draw(hm_bin_auc, heatmap_legend_side="top", annotation_legend_side="right") 
+
+```
+
+
+
+```{r select}
+
+surv_list$under[is.na(surv_list$under)] <- 70
+surv_list$over[is.na(surv_list$over)] <- 70
+surv_list %>%
+  dplyr::left_join(surv_pvals, by=c("subtype", "program")) %>%
+  dplyr::filter(pvalue <= 0.05) %>%
+  dplyr::arrange(pvalue) %>%
+  dplyr::mutate(overminunder=over-under) %>%
+  dplyr::select(program, subtype, overminunder, importance) %>%
+  dplyr::distinct() ->
+  prog_select
+
+dbs <- c("reactome", "oncod", "curatec2d", "keggd")
+
+count_cut <- 2  ## number of genes enriched
+enrich_cut <- 0.05  ## FDR p-value cutoff for enrichment
+
+surv_list %>%
+  dplyr::mutate(program=str_replace(program, "P", "Pr")) %>%
+  dplyr::group_by(program) %>%
+  dplyr::mutate(subtypes=paste(subtype, collapse="/")) %>%
+  dplyr::select(program, subtypes) %>%
+  distinct() ->
+  prog_sub
+
+```
+
+## Bubble plot of relevant programs  
+  
+```{r bubbly}
+
+prog_select %<>% dplyr::mutate(program=str_replace(program, "P", "Pr"))
+
+ggplot(prog_select, aes(x=subtype, y=program)) + geom_point(aes(size=importance, color=overminunder)) +
+  scale_color_gradient2(low="blue", high="red") + 
+  xlab("Risk prediction models") + ylab("Programs") + 
+  labs(color="Delta-PFS\n(months)", size="Relative\nImportance") +
+  theme(legend.position="top")
+ggsave(here("output/risk_model_programs_bubble.pdf"))
+
+surv_list %>%
+  dplyr::mutate(overminunder=over-under) -> tmp
+ggplot(tmp, aes(x=subtype, y=program)) + geom_point(aes(size=importance, color=overminunder)) +
+  scale_color_gradient2(low="blue", high="red") + 
+  xlab("Risk prediction models") + ylab("Programs") + 
+  labs(color="Delta-PFS\n(months)", size="Relative\nImportance")
+
+```
